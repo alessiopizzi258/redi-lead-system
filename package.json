@@ -1,0 +1,49 @@
+{
+  "name": "nexus-engine",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "lint": "eslint",
+    "worker": "tsx -r tsconfig-paths/register src/lib/workers/emailWorker.ts"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.81.0",
+    "@prisma/adapter-pg": "^7.9.1",
+    "@prisma/client": "^7.9.1",
+    "@upstash/ratelimit": "^2.0.8",
+    "@upstash/redis": "^1.38.3",
+    "bull": "^4.16.5",
+    "bullmq": "^5.71.1",
+    "dotenv": "^17.3.1",
+    "imapflow": "^1.3.3",
+    "ioredis": "^5.10.1",
+    "lucide-react": "^1.38.0",
+    "next": "16.2.1",
+    "nodemailer": "^8.0.7",
+    "openai": "^6.32.0",
+    "pg": "^8.23.0",
+    "react": "19.2.4",
+    "react-dom": "19.2.4",
+    "resend": "^6.12.3",
+    "svix": "^1.93.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@tailwindcss/postcss": "^4",
+    "@types/node": "^20.19.43",
+    "@types/nodemailer": "^8.0.0",
+    "@types/pg": "^8.21.0",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
+    "@types/ws": "^8.18.1",
+    "eslint": "^9",
+    "eslint-config-next": "16.2.1",
+    "prisma": "^7.9.1",
+    "tailwindcss": "^4",
+    "tsx": "^4.21.0",
+    "typescript": "^5"
+  }
+}

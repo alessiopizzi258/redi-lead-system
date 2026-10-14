@@ -1,0 +1,264 @@
+generator client {
+  provider = "prisma-client-js"
+  previewFeatures = ["driverAdapters"]
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// -----------------------------
+// ENUMS (RLS Specifics)
+// -----------------------------
+
+enum Urgency {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+enum Role {
+  OWNER
+  MANAGER
+  DIRECTOR
+  C_LEVEL
+  EMPLOYEE
+  OTHER
+}
+
+enum LeadStatus {
+  PENDING_OTP
+  PENDING_VERIFICATION // <-- Aggiunto per l'isolamento dei lead Social
+  NURTURING            // <-- Aggiunto per il parcheggio dei lead non caldi
+  ACTIVE
+  QUALIFIED
+  DA_VERIFICARE_MANUALMENTE
+  ANOMALO
+  REJECTED
+}
+
+// -----------------------------
+// MODELS
+// -----------------------------
+
+// Livello 2 (OTP)
+model OtpToken {
+  id        String   @id @default(cuid())
+  token     String
+  profileId String
+  profile   Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  expiresAt DateTime
+  createdAt DateTime @default(now())
+
+  @@index([token])
+}
+
+model Tenant {
+  id             String          @id @default(uuid())
+  companyName    String
+  adminEmail     String?         @unique 
+  apiKey         String          @unique 
+  createdAt      DateTime        @default(now())
+  
+  sequences      Sequence[]
+  profiles       Profile[]
+  campaigns      Campaign[]
+  automationLogs AutomationLog[]
+  trackingEvents TrackingEvent[]
+
+  @@index([apiKey])
+}
+
+model Profile {
+  id              String     @id @default(uuid())
+  tenantId        String
+  email           String     
+  firstName       String?
+  lastName        String?   
+  phone           String?   
+
+  sequenceStates LeadSequenceState[]
+  
+  isVerified      Boolean    @default(false)
+  status          LeadStatus @default(PENDING_OTP)
+  
+  // --- Parametri RLS (Setaccio Algoritmico) ---
+  problemDescription String? @db.Text
+  urgency            Urgency?
+  role               Role?
+  budget             Float?
+  icpScore           Int       @default(0) // Punteggio matematico qualificazione
+  
+  // --- Metriche Operative & Tracking ---
+  industry        String?    
+  coherenceScore  Int        @default(0)
+  source          String?    
+  lastIp          String?    // Reverse lookup
+  fingerprint     String?    // Tracciamento passivo
+
+  passiveScore    Int       @default(0)
+  lastDecayedAt   DateTime?
+  
+  // --- Metriche RFM ---
+  recency         Int       @default(0)
+  frequency       Int       @default(0)
+  monetary        Int       @default(0)
+  segment         String    @default("Freddo")
+  
+  // --- Dati Operativi ARCH ---
+  arch_angle      String?
+  is_proxy        Boolean   @default(false)
+  contactCount    Int       @default(0)
+  totalClicks     Int       @default(0)
+  totalRevenue    Float     @default(0)
+  lastActivityAt  DateTime?
+  lastContactedAt DateTime?
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @default(now()) @updatedAt
+
+  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  otpTokens       OtpToken[]
+  automationLogs  AutomationLog[]
+  trackingEvents  TrackingEvent[]
+  webActivities   WebActivity[]   // Relazione con le attività web ombra
+
+  utmSource        String?
+  utmCampaign      String?
+  utmMedium        String?
+
+  @@unique([tenantId, email]) 
+}
+
+model Sequence {
+  id          String          @id @default(cuid())
+  tenantId    String
+  name        String
+  description String?
+  isActive    Boolean         @default(true)
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  tenant      Tenant          @relation(fields: [tenantId], references: [id])
+  emails      EmailTemplate[]
+  enrollments LeadSequenceState[]
+}
+
+model EmailTemplate {
+  id          String   @id @default(cuid())
+  sequenceId  String
+  stepNumber  Int      // 1, 2, 3...
+  delayDays   Int      // Giorni di attesa dall'email precedente (es. 0 per immediato, 3 per la successiva)
+  subject     String
+  plainText   String   // Niente HTML, focus su Inboxing Primario (framework PAS/BAB)
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  sequence    Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+}
+
+model LeadSequenceState {
+  id             String   @id @default(cuid())
+  profileId      String
+  sequenceId     String
+  currentStep    Int      @default(0) // Step dell'ultima email inviata
+  enrolledAt     DateTime @default(now())
+  lastEmailedAt  DateTime? // Data dell'ultimo invio per calcolare il delay
+  isCompleted    Boolean  @default(false)
+  isUnsubscribed Boolean  @default(false)
+
+  profile        Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  sequence       Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+
+  @@unique([profileId, sequenceId])
+}
+
+model Campaign {
+  id               String   @id @default(uuid())
+  tenantId         String
+  name             String
+  dailyLimit       Int      @default(20)
+  status           String   @default("DRAFT")
+  winningVariantId String?  // Vincitore A/B Test
+  createdAt        DateTime @default(now())
+
+  tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+}
+
+model AutomationLog {
+  id           String   @id @default(uuid())
+  tenantId     String
+  resendId     String?  @unique
+  profileId    String
+  campaignId   String?  // Necessario per calcolare l'A/B test sulla singola campagna
+  variantId    String?  // Necessario per differenziare Variante A e Variante B
+  messageId    String?  @unique
+  emailAddress String
+  subject      String
+  status       String   // Tipi: SENT, FAILED, BLOCKED, OPENED, ecc.
+  spamScore    Float?
+  bounceHard   Boolean  @default(false)
+  errorMessage String?
+  timestamp    DateTime @default(now())
+
+  tenant       Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  profile      Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([tenantId])
+  @@index([profileId])
+  @@index([campaignId, variantId]) // Ottimizza le query per il ricalcolo A/B Test
+}
+
+model GmailSender {
+  id            String    @id @default(uuid())
+  email         String    @unique
+  appPassword   String    
+  provider      String    @default("GMAIL") // "GMAIL" o "CUSTOM"
+  smtpHost      String?   
+  smtpPort      Int?      @default(465)
+  imapHost      String?   
+  imapPort      Int?      @default(993)
+  isActive      Boolean   @default(true)
+  dailyLimit    Int       @default(10)
+  sentToday     Int       @default(0)
+  lastSentAt    DateTime?
+  quarantineUntil DateTime?
+  errorLog      String?
+  createdAt     DateTime  @default(now())
+  updatedAt     DateTime  @updatedAt
+}
+
+model TrackingEvent {
+  id          String   @id @default(uuid())
+  type        String   // "CLICK", "OPEN", "PAGE_VIEW"
+  url         String?  
+  profileId   String
+  tenantId    String
+  campaignId  String?
+  timestamp   DateTime @default(now())
+
+  profile     Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  tenant      Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+
+  @@index([profileId])
+  @@index([tenantId])
+}
+
+// NUOVO MODELLO: Motore di Deanonimizzazione (Shadow Pixel)
+model WebActivity {
+  id              String   @id @default(uuid())
+  profileId       String?  // Relazione opzionale (nullo se è un utente fantasma)
+  fingerprint     String   // ID hardware/browser
+  url             String
+  duration        Int      // Tempo di permanenza in secondi
+  scrollDepth     Int      // Profondità in pixel
+  timestamp       DateTime @default(now())
+
+  profile         Profile? @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  urlScoreAwarded Boolean  @default(false)
+  
+  @@index([fingerprint])
+  @@index([profileId])
+}
