@@ -117,26 +117,8 @@ export async function syncRfmDatabase(tenantId: string) {
     let updatedCount = 0;
 
     for (const profile of profiles) {
-      let r = 0, f = 0, m = 0, totalScore = 0;
-      let segment: Parameters<typeof RfmService.pickAngle>[0] = "Freddo";
-
-      if (profile.contactCount === 0 && profile.totalRevenue === 0) {
-        segment = "Freddo";
-      } else {
-        r = RfmService.calculateRecency(profile.lastActivityAt);
-        f = RfmService.calculateFrequency(profile.contactCount);
-        m = RfmService.calculateMonetary(profile.totalRevenue);
-        totalScore = r + f + m;
-        segment = RfmService.classifySegment(totalScore) as typeof segment;
-      }
-
-      const archAngle = RfmService.pickAngle(segment, profile.email);
-
-      await prisma.profile.update({
-        where: { id: profile.id },
-        data: { recency: r, frequency: f, monetary: m, segment, arch_angle: archAngle }
-      });
-      
+      // Invocazione diretta e chirurgica del nuovo motore RFM
+      await RfmService.syncProfileScore(profile.id);
       updatedCount++;
     }
 
