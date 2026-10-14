@@ -3,7 +3,7 @@ import { prisma } from "@/lib/prisma";
 import { RfmService } from "@/lib/services/rfmService";
 
 export const dynamic = "force-dynamic";
-export const revalidate = 0; // Disinnesco totale della cache
+export const revalidate = 0;
 
 export async function POST(req: NextRequest) {
   try {
@@ -22,7 +22,7 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, error: "Tenant ID mancante." }, { status: 400 });
     }
 
-    console.log(`⚙️ [Orchestratore] Avvio Ricalcolo RFM Massivo per Tenant: ${tenantId}`);
+    console.log(`⚙️ [Orchestratore] Avvio Sincronizzazione RFM Massiva per Tenant: ${tenantId}`);
 
     const profiles = await prisma.profile.findMany({
       where: {
@@ -34,42 +34,16 @@ export async function POST(req: NextRequest) {
     let updatedCount = 0;
 
     for (const profile of profiles) {
-      let r = 0, f = 0, m = 0, totalScore = 0;
-      
-      // 🛡️ BASTA ACROBAZIE TYPESCRIPT: Usiamo un tipo flessibile per non far crashare Vercel
-      let segment: any = "Freddo";
-
-      if (profile.contactCount === 0 && profile.totalRevenue === 0) {
-        segment = "Freddo";
-      } else {
-        r = RfmService.calculateRecency(profile.lastActivityAt);
-        f = RfmService.calculateFrequency(profile.contactCount);
-        m = RfmService.calculateMonetary(profile.totalRevenue);
-        totalScore = r + f + m;
-        segment = RfmService.classifySegment(totalScore);
-      }
-
-      const archAngle = RfmService.pickAngle(segment, profile.email);
-
-      await prisma.profile.update({
-        where: { id: profile.id },
-        data: { 
-          recency: r, 
-          frequency: f, 
-          monetary: m, 
-          segment, 
-          arch_angle: archAngle 
-        }
-      });
-      
+      // Invochiamo il motore centrale che gestisce calcolo, db update e warming trigger
+      await RfmService.syncProfileScore(profile.id);
       updatedCount++;
     }
 
-    console.log(`✅ [Orchestratore] Completato. Profili allineati: ${updatedCount}`);
+    console.log(`✅ [Orchestratore] Completato. Profili riallineati: ${updatedCount}`);
 
     return NextResponse.json({ 
       success: true, 
-      message: "Orchestrazione ARCH completata con successo.",
+      message: "Orchestrazione RFM completata con successo.",
       updatedCount 
     });
 
