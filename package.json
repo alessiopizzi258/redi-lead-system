@@ -4,10 +4,10 @@
   "private": true,
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
+    "build": "prisma generate && next build",
     "start": "next start",
-    "lint": "eslint",
-    "worker": "tsx -r tsconfig-paths/register src/lib/workers/emailWorker.ts"
+    "lint": "next lint",
+    "worker": "node --import tsx/esm src/lib/workers/emailWorker.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",
