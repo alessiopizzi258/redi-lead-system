@@ -1,12 +1,1 @@
-{
-  "crons": [
-    {
-      "path": "/api/cron/daily-fire",
-      "schedule": "0 9 * * *"
-    },
-    {
-      "path": "/api/cron/decay-score",
-      "schedule": "0 3 * * *" 
-    }
-  ]
-}
+{}
