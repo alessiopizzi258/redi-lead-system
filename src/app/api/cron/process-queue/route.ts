@@ -1,10 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { prisma } from "@/lib/prisma";
-// Importa il tuo servizio di invio email, es:
-// import { DeliveryService } from "@/lib/services/deliveryService"; 
+import { DeliveryService } from "@/lib/services/deliveryService";
 
 export const dynamic = 'force-dynamic';
-export const maxDuration = 10; // Vercel Hobby taglia i processi dopo 10-15s
+export const maxDuration = 10; 
 
 export async function GET(req: NextRequest) {
   const authHeader = req.headers.get('authorization');
@@ -15,11 +14,10 @@ export async function GET(req: NextRequest) {
   }
 
   try {
-    // 1. Pesca 5 email in attesa di essere spedite (Batch piccolo per evitare timeout Vercel)
     const pendingLogs = await prisma.automationLog.findMany({
       where: { status: "APPROVED" },
       take: 5,
-      orderBy: { id: 'asc' } // <- Sostituito con l'ID
+      orderBy: { id: 'asc' } 
     });
 
     if (pendingLogs.length === 0) {
@@ -28,17 +26,25 @@ export async function GET(req: NextRequest) {
 
     let sentCount = 0;
 
-    // 2. Ciclo di spedizione
     for (const log of pendingLogs) {
-      // QUI INSERISCI LA LOGICA DI INVIO REALE (es. tramite Resend o GmailSender)
-      // await DeliveryService.sendEmail({ to: log.emailAddress, subject: log.subject, html: log.errorMessage });
+        // Disinnesco anti-null: Garantisce che subject ed errorMessage siano sempre stringhe
+        const safeSubject = log.subject || "Check rapido"; 
+        const safeHtml = log.errorMessage || "<p>Email vuota per errore sistema.</p>";
 
-      // 3. Aggiorna lo stato nel DB
-      await prisma.automationLog.update({
-        where: { id: log.id },
-        data: { status: "SENT" } // Pulito e allineato allo schema
-      });
-      sentCount++;
+        const success = await DeliveryService.sendColdEmailToProspect(
+            log.tenantId, 
+            log.emailAddress, 
+            safeSubject, 
+            safeHtml 
+        );
+
+        if (success) {
+            await prisma.automationLog.update({
+              where: { id: log.id },
+              data: { status: "SENT" } 
+            });
+            sentCount++; // Incremento corretto
+        }
     }
 
     return NextResponse.json({ success: true, message: `Spedite ${sentCount} email con successo.` });

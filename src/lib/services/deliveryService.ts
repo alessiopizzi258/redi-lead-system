@@ -1,162 +1,133 @@
-/**
- * @file src/lib/services/deliveryService.ts
- * @description
- * Servizio di inoltro a latenza ottimizzata per i Lead Qualificati.
- * Gestisce l'invio via Email (simulato per Resend/Nodemailer) e via Webhook (API).
- */
-
 import { prisma } from "@/lib/prisma";
+import nodemailer from "nodemailer";
 
 export class DeliveryService {
   /**
-   * Consegna il Lead Qualificato all'amministratore del Tenant.
-   * Isolato con try/catch globale per impedire il crash del Worker chiamante.
+   * MOTORE 1: Spedisce la Cold Email al Prospect usando le caselle del Tenant.
    */
-  static async sendLeadToTenant(profileId: string, tenantId: string): Promise<boolean> {
-    console.log(`[DELIVERY] Avvio inoltro Lead [${profileId}] al Tenant [${tenantId}]...`);
-
+  static async sendColdEmailToProspect(tenantId: string, to: string, subject: string, html: string): Promise<boolean> {
     try {
-      // 1. Estrazione dati relazionali (Profile + Tenant)
-      const profile = await prisma.profile.findUnique({
-        where: { id: profileId },
+      const sender = await prisma.gmailSender.findFirst({
+        where: { tenantId, isActive: true },
+        orderBy: { sentToday: 'asc' }
       });
 
-      const tenant = await prisma.tenant.findUnique({
-        where: { id: tenantId },
-      });
-
-      if (!profile || !tenant) {
-        console.error(`❌ [DELIVERY] Dati mancanti. Inoltro annullato.`);
+      if (!sender) {
+        console.error(`❌ [SMTP] Nessuna casella attiva trovata per il Tenant ${tenantId}`);
         return false;
       }
 
-      if (!tenant.adminEmail) {
-        console.warn(`⚠️ [DELIVERY] Nessuna adminEmail configurata per il Tenant ${tenant.companyName}.`);
-        // In un caso reale, potremmo comunque tentare il webhook
-      }
+      const transporter = nodemailer.createTransport({
+        host: 'smtp.gmail.com',
+        port: 465,
+        secure: true,
+        auth: {
+          user: sender.email,
+          pass: sender.appPassword || "" // Bypassa il blocco se il DB lo segna come null
+        }
+      });
 
-      // 2. Costruzione Payload Standardizzato
-      const leadPayload = {
-        lead_id: profile.id,
-        contact: {
-          first_name: profile.firstName,
-          last_name: profile.lastName,
-          email: profile.email,
-          phone: profile.phone,
-        },
-        qualification: {
-          icp_score: profile.icpScore,
-          urgency: profile.urgency,
-          role: profile.role,
-          budget: profile.budget,
-          problem_description: profile.problemDescription,
-        },
-        timestamp: new Date().toISOString(),
-      };
+      await transporter.sendMail({
+        from: `"Team" <${sender.email}>`, // Sicuro al 100%, usa solo l'email dal DB
+        to,
+        subject,
+        html
+      });
 
-      // 3. Esecuzione Parallela dei Canali di Consegna
-      const deliveryTasks = [];
+      await prisma.gmailSender.update({
+        where: { id: sender.id },
+        data: { sentToday: { increment: 1 } }
+      });
 
-      if (tenant.adminEmail) {
-        deliveryTasks.push(this.simulateEmailDelivery(tenant.adminEmail, leadPayload, tenant.companyName));
-      }
-
-      // Simulazione presenza Webhook nel record Tenant (es. tenant.webhookUrl)
-      // Ipotizziamo una variabile fittizia per dimostrazione
-      const webhookUrl = process.env.MOCK_WEBHOOK_URL; 
-      if (webhookUrl) {
-        deliveryTasks.push(this.fireWebhook(webhookUrl, leadPayload));
-      }
-
-      // Attendiamo l'esito di tutti i canali senza bloccarci al primo errore
-      const results = await Promise.allSettled(deliveryTasks);
-      
-      const hasSuccess = results.some((result) => result.status === "fulfilled" && result.value === true);
-      
-      if (hasSuccess) {
-        console.log(`✅ [DELIVERY] Lead [${profileId}] consegnato con successo.`);
-        return true;
-      } else {
-        console.error(`❌ [DELIVERY] Fallimento totale su tutti i canali di inoltro per Lead [${profileId}].`);
-        return false;
-      }
-
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : "Errore sconosciuto";
-      console.error(`🚨 [DELIVERY FATAL ERROR]: ${errorMessage}`);
-      return false; // Il worker BullMQ riproverà in base alla policy di backoff
-    }
-  }
-
-  /**
-   * Simulazione invio Email tramite provider (es. Resend)
-   */
-  private static async simulateEmailDelivery(to: string, payload: any, companyName: string): Promise<boolean> {
-    try {
-      const emailText = `
-🚀 NUOVO LEAD QUALIFICATO PER ${companyName} 🚀
-
-Il sistema RLS ha setacciato e qualificato un nuovo prospect.
-
-DATI CONTATTO:
-- Nome: ${payload.contact.first_name || "N/D"} ${payload.contact.last_name || "N/D"}
-- Email: ${payload.contact.email}
-- Telefono: ${payload.contact.phone || "N/D"}
-
-PROFILAZIONE (ICP Score: ${payload.qualification.icp_score}/100):
-- Urgenza: ${payload.qualification.urgency}
-- Ruolo: ${payload.qualification.role}
-- Budget: €${payload.qualification.budget || "Non specificato"}
-
-PROBLEMA: 
-${payload.qualification.problem_description || "N/D"}
-
-Accedi alla dashboard per i dettagli completi.
-      `;
-
-      // Simula il ritardo di rete API (es. chiamata a Resend)
-      await new Promise((resolve) => setTimeout(resolve, 800));
-      
-      // In produzione: await resend.emails.send({ ... })
-      console.log(`✉️ [EMAIL] Inviata a ${to}:\n${emailText}`);
-      
+      console.log(`✉️ [SMTP] Cold Email inviata con successo a ${to} tramite ${sender.email}`);
       return true;
-    } catch (error) {
-      console.error(`❌ [EMAIL] Errore invio a ${to}`, error);
+
+    } catch (error: any) {
+      console.error(`🚨 [SMTP FATAL ERROR] Invio a ${to} fallito:`, error.message);
       return false;
     }
   }
 
   /**
-   * Inoltro payload tramite Webhook con timeout di sicurezza (5 secondi)
+   * MOTORE 2: Consegna il Lead Qualificato all'amministratore del Tenant.
    */
+  static async sendLeadToTenant(profileId: string, tenantId: string): Promise<boolean> {
+    console.log(`[DELIVERY] Avvio inoltro Lead [${profileId}] al Tenant [${tenantId}]...`);
+
+    try {
+      const profile = await prisma.profile.findUnique({ where: { id: profileId } });
+      const tenant = await prisma.tenant.findUnique({ where: { id: tenantId } });
+
+      if (!profile || !tenant) return false;
+
+      const leadPayload = {
+        lead_id: profile.id,
+        contact: {
+          first_name: profile.firstName || "N/D",
+          last_name: profile.lastName || "N/D",
+          email: profile.email,
+          phone: profile.phone || "N/D",
+        },
+        qualification: {
+          icp_score: (profile as any).icpScore || 0,
+          urgency: (profile as any).urgency || "N/D", // Disinnesco per campi mancanti
+          budget: (profile as any).budget || "N/D",   // Disinnesco per campi mancanti
+        },
+        timestamp: new Date().toISOString(),
+      };
+
+      const deliveryTasks = [];
+      const adminEmail = (tenant as any).adminEmail;
+      const companyName = (tenant as any).companyName || "Azienda";
+
+      if (adminEmail) {
+        deliveryTasks.push(this.notifyAdminViaEmail(tenantId, adminEmail, leadPayload, companyName));
+      }
+
+      const webhookUrl = process.env.MOCK_WEBHOOK_URL; 
+      if (webhookUrl) {
+        deliveryTasks.push(this.fireWebhook(webhookUrl, leadPayload));
+      }
+
+      const results = await Promise.allSettled(deliveryTasks);
+      return results.some((result) => result.status === "fulfilled" && result.value === true);
+
+    } catch (error) {
+      console.error(`🚨 [DELIVERY FATAL ERROR]`, error);
+      return false; 
+    }
+  }
+
+  private static async notifyAdminViaEmail(tenantId: string, to: string, payload: any, companyName: string): Promise<boolean> {
+    const htmlText = `
+      <h3>🔥 NUOVO LEAD QUALIFICATO PER ${companyName}</h3>
+      <p>Il Redi Lead System ha qualificato un nuovo prospect.</p>
+      <ul>
+        <li><b>Nome:</b> ${payload.contact.first_name} ${payload.contact.last_name}</li>
+        <li><b>Email:</b> ${payload.contact.email}</li>
+        <li><b>Telefono:</b> ${payload.contact.phone}</li>
+        <li><b>ICP Score:</b> ${payload.qualification.icp_score}/100</li>
+      </ul>
+      <p>Accedi alla dashboard per i dettagli.</p>
+    `;
+
+    return this.sendColdEmailToProspect(tenantId, to, `🔥 Lead Qualificato: ${payload.contact.email}`, htmlText);
+  }
+
   private static async fireWebhook(url: string, payload: any): Promise<boolean> {
     try {
-      // Usa AbortSignal per prevenire code bloccate da CRM lenti
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), 5000);
-
       const response = await fetch(url, {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "RLS-Delivery-Engine/1.0",
-        },
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
         signal: controller.signal,
       });
-
       clearTimeout(timeoutId);
-
-      if (!response.ok) {
-        throw new Error(`HTTP Status ${response.status}`);
-      }
-
-      console.log(`🔌 [WEBHOOK] Payload consegnato a ${url} (Status: ${response.status})`);
+      if (!response.ok) throw new Error(`HTTP Status ${response.status}`);
       return true;
-    } catch (error: unknown) {
-      const errorMessage = error instanceof Error ? error.message : "Errore timeout/rete";
-      console.error(`❌ [WEBHOOK] Fallimento consegna a ${url}: ${errorMessage}`);
+    } catch (error) {
       return false;
     }
   }
