@@ -36,7 +36,7 @@ export async function GET(req: NextRequest) {
       // 3. Aggiorna lo stato nel DB
       await prisma.automationLog.update({
         where: { id: log.id },
-        data: { status: "SENT", sentAt: new Date() }
+        data: { status: "SENT" } // Pulito e allineato allo schema
       });
       sentCount++;
     }
