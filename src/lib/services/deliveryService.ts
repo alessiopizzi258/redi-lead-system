@@ -9,7 +9,7 @@ export class DeliveryService {
     try {
       // 1. Pesca il mittente SMTP dell'azienda con meno invii oggi (Load Balancing)
       const sender = await prisma.gmailSender.findFirst({
-        where: { tenantId, isActive: true } as any, // <- Forzatura anti-errore TypeScript
+        where: { isActive: true }, // Pesca la casella attiva più libera dal pool globale
         orderBy: { sentToday: 'asc' }
       });
 
