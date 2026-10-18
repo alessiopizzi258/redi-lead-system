@@ -1,10 +1,8 @@
 "use server";
 
 import { prisma } from "@/lib/prisma";
-import { Resend } from "resend";
 import { revalidatePath } from "next/cache";
-
-const resend = new Resend(process.env.RESEND_API_KEY);
+import { DeliveryService } from "@/lib/services/deliveryService";
 
 export async function approveAndSendEmail(
   logId: string,
@@ -23,17 +21,16 @@ export async function approveAndSendEmail(
       return { success: false, error: "Bozza inesistente o già processata." };
     }
 
-    // 2. Sparo con Resend
-    const { data, error } = await resend.emails.send({
-      from: `Design Lab Studio <alessio@designlabstudio.it>`, // Inserisci il TUO dominio verificato
-      to: [draft.emailAddress],
-      subject: finalSubject,
-      html: finalHtml || "",
-    });
+    // 2. Sparo con il motore SMTP proprietario (Zero Costi, no Resend)
+    const success = await DeliveryService.sendColdEmailToProspect(
+      tenantId,
+      draft.emailAddress,
+      finalSubject,
+      finalHtml
+    );
 
-    if (error) {
-      console.error("Resend Error:", error);
-      return { success: false, error: error.message };
+    if (!success) {
+      return { success: false, error: "Fallimento SMTP. Verifica di aver armato la casella in Multi-Sling Radar." };
     }
 
     // 3. Aggiorna DB (Sposta da Quarantena a Inviato)
@@ -58,7 +55,7 @@ export async function approveAndSendEmail(
     // Ricarica la pagina della dashboard in automatico
     revalidatePath("/dashboard/hitl");
 
-    return { success: true, emailId: data?.id };
+    return { success: true };
 
   } catch (error: any) {
     console.error("Errore critico in approvazione:", error);
@@ -68,7 +65,6 @@ export async function approveAndSendEmail(
 
 export async function rejectDraft(logId: string, tenantId: string) {
   try {
-    // Elimina fisicamente la bozza o cambiane lo stato
     await prisma.automationLog.delete({
       where: { id: logId }
     });
