@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import { Worker, Job } from 'bullmq';
 import IORedis from 'ioredis';
+import { buildScintillaTemplate } from '@/lib/utils/emailWrapper';
 import { prisma } from '@/lib/prisma';
 import { sendViaGmailRotator } from '@/lib/services/gmailService'; // Oppure Resend
 
@@ -23,6 +24,7 @@ const nurturingWorker = new Worker(
         profile: true,
         sequence: {
           include: {
+            tenant: true, // <-- Join relazionale per estrarre companyName
             emails: { orderBy: { stepNumber: 'asc' } }
           }
         }
@@ -66,21 +68,36 @@ const nurturingWorker = new Worker(
       }
 
       try {
-        // 4. Iniezione Tracciamento Invisibile (Link e Pixel)
+        // 4. Iniezione Layout Dinamico e Tracciamento
         const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://tuodominio.it";
+        const tenantId = enrollment.profile.tenantId;
+        const tenantName = enrollment.sequence.tenant.companyName; // <-- Referenza risolta
         
-        // Convertiamo il PlainText in HTML minimale per supportare il pixel e i link tracciati
-        let bodyHtml = `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #111;">`;
-        bodyHtml += nextEmail.plainText.replace(/\n/g, '<br/>');
-        
-        // Pixel di apertura per il calcolo dell'intento
-        bodyHtml += `<img src="${baseUrl}/api/tracking/open?uid=${enrollment.profile.id}&tid=${enrollment.profile.tenantId}" width="1" height="1" style="display:none;" />`;
-        bodyHtml += `</div>`;
+        let bodyHtml = "";
 
-        // Modifica dinamica: Trasforma eventuali link inseriti in tracking link proprietari
+        // Dispatcher dei Layout per Tenant
+        if (tenantName.includes("Scintilla")) {
+          bodyHtml = buildScintillaTemplate(nextEmail.plainText);
+        } else {
+          // Layout di Default Minimal per i futuri tenant
+          bodyHtml = `
+            <div style="font-family: Arial, sans-serif; font-size: 14px; color: #111;">
+              ${nextEmail.plainText.replace(/\n/g, '<br/>')}
+            </div>`;
+        }
+        
+        // Pixel di apertura iniettato prima della chiusura del tag body o alla fine
+        const trackingPixel = `<img src="${baseUrl}/api/tracking/open?uid=${enrollment.profile.id}&tid=${tenantId}" width="1" height="1" style="display:none;" />`;
+        if (bodyHtml.includes("</body>")) {
+          bodyHtml = bodyHtml.replace("</body>", `${trackingPixel}</body>`);
+        } else {
+          bodyHtml += trackingPixel;
+        }
+
+        // Sostituzione dei link per il tracciamento click
         bodyHtml = bodyHtml.replace(
           /href=["'](https?:\/\/[^"']+)["']/gi, 
-          `href="${baseUrl}/api/track/click?uid=${enrollment.profile.id}&tid=${enrollment.profile.tenantId}&url=$1"`
+          `href="${baseUrl}/api/track/click?uid=${enrollment.profile.id}&tid=${tenantId}&url=$1"`
         );
 
         // 5. Sparo tramite il rotatore nativo
