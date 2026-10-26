@@ -6,6 +6,7 @@ import { prisma } from '@/lib/prisma';
 import { sendViaGmailRotator } from '@/lib/services/gmailService'; // Oppure Resend
 
 const connection = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null, // <-- RIGA OBBLIGATORIA AGGIUNTA
   tls: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
 });
 
