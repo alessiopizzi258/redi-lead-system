@@ -51,8 +51,6 @@ export default async function DatabasePage() {
           </div>
         </div>
 
-        <DeliveryMonitor tenantId={tenant.id} />
-
         {/* Manager Inserimento */}
         <div className="lg:col-span-1 h-full">
           <LeadManager tenantId={tenant.id} apiKey={tenant.apiKey} />

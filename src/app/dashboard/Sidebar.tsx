@@ -12,6 +12,7 @@ export default function Sidebar() {
     { name: "Outbound Live", path: "/dashboard/outbound", icon: "M22 2L11 13 M22 2l-7 20-4-9-9-4 20-7z" },
     { name: "Database CRM", path: "/dashboard/database", icon: "M4 4h16v16H4z M4 8h16 M8 4v16" },
     { name: "Nurturing Engine", path: "/dashboard/nurturing", icon: "M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z" },
+    { name: "Sender logs", path: "/dashboard/logs", icon: "M4 4h16v6H4z M4 14h16v6H4z M8 7v.01 M8 17v.01" },
   ];
 
   return (
