@@ -9,8 +9,9 @@ export const dynamic = "force-dynamic";
 const connection = new IORedis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: null,
   connectTimeout: 5000,
+  family: 4, // <-- FORZA LA RISOLUZIONE IPv4 (Annulla i bug DNS)
   retryStrategy(times) {
-    if (times > 3) return null; // Interrompe i tentativi dopo 3 fallimenti
+    if (times > 3) return null;
     return Math.min(times * 200, 1000);
   },
   tls: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined

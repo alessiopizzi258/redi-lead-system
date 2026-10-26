@@ -6,7 +6,13 @@ import { prisma } from '@/lib/prisma';
 import { sendViaGmailRotator } from '@/lib/services/gmailService'; // Oppure Resend
 
 const connection = new IORedis(process.env.REDIS_URL!, {
-  maxRetriesPerRequest: null, // <-- RIGA OBBLIGATORIA AGGIUNTA
+  maxRetriesPerRequest: null,
+  connectTimeout: 5000,
+  family: 4, // <-- FORZA LA RISOLUZIONE IPv4 (Annulla i bug DNS)
+  retryStrategy(times) {
+    if (times > 3) return null;
+    return Math.min(times * 200, 1000);
+  },
   tls: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
 });
 
