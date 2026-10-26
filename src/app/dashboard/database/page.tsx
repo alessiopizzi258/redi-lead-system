@@ -3,6 +3,7 @@ import LeadManager from "@/app/dashboard/LeadManager";
 import TriggerButton from "@/app/dashboard/TriggerButton";
 import RfmSyncButton from "@/app/dashboard/RfmSyncButton";
 import EnrollButton from "@/components/EnrollButton";
+import DeliveryMonitor from '@/components/DeliveryMonitor';
 
 export const dynamic = 'force-dynamic';
 
@@ -49,6 +50,8 @@ export default async function DatabasePage() {
             <SegmentRow label="Dormiente (0 pt)" count={segments.Dormiente} total={totalContacts} color="bg-slate-200" />
           </div>
         </div>
+
+        <DeliveryMonitor tenantId={tenant.id} />
 
         {/* Manager Inserimento */}
         <div className="lg:col-span-1 h-full">
