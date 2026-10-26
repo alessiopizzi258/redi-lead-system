@@ -1,5 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { Queue } from 'bullmq';
+import IORedis from 'ioredis';
+
+const connection = new IORedis(process.env.REDIS_URL!, {
+  tls: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
+});
 
 export const dynamic = "force-dynamic";
 
@@ -52,6 +58,13 @@ export async function POST(req: NextRequest) {
     const result = await prisma.leadSequenceState.createMany({
       data: enrollments,
       skipDuplicates: true
+    });
+
+    // NUOVO: Sveglia il Worker per iniziare le spedizioni immediatamente
+    const nurturingQueue = new Queue('nurturing-queue', { connection });
+    await nurturingQueue.add('start-campaigns', {}, { 
+      removeOnComplete: true, 
+      removeOnFail: true 
     });
 
     return NextResponse.json({ success: true, count: result.count, message: "Lead agganciati con successo." }, { status: 200 });
