@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useRef } from "react";
-import { addSingleLead, importCsvLeads } from "./actions";
+import { addSingleLead } from "./actions"; // Ho rimosso importCsvLeads, ora usiamo l'API diretta
 
 export default function LeadManager({ tenantId }: { tenantId: string }) {
   const [loading, setLoading] = useState(false);
@@ -25,7 +25,8 @@ export default function LeadManager({ tenantId }: { tenantId: string }) {
     setLoading(false);
   }
 
-  async function handleCsvUpload(e: React.ChangeEvent<HTMLInputElement>) {
+  // NUOVO MOTORE DI UPLOAD EXCEL / CSV
+  async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
 
@@ -35,13 +36,27 @@ export default function LeadManager({ tenantId }: { tenantId: string }) {
     const formData = new FormData();
     formData.append("file", file);
 
-    const result = await importCsvLeads(formData, tenantId);
+    try {
+      // Punta all'API Route che abbiamo ingegnerizzato prima per l'Excel
+      const res = await fetch('/api/leads/import', {
+        method: 'POST',
+        headers: {
+          'x-tenant-id': tenantId // Passiamo l'ID per l'isolamento multi-tenant
+        },
+        body: formData
+      });
 
-    if (result.error) setMessage({ text: result.error, type: "error" });
-    else setMessage({ text: `${result.count} Lead iniettati nel sistema.`, type: "success" });
-    
-    if (fileRef.current) fileRef.current.value = "";
-    setLoading(false);
+      const data = await res.json();
+
+      if (!res.ok) throw new Error(data.error || "Upload fallito dal server");
+      
+      setMessage({ text: `Iniezione completata: ${data.added} aggiunti, ${data.skipped} saltati.`, type: "success" });
+    } catch (err: any) {
+      setMessage({ text: err.message, type: "error" });
+    } finally {
+      if (fileRef.current) fileRef.current.value = "";
+      setLoading(false);
+    }
   }
 
   return (
@@ -49,8 +64,8 @@ export default function LeadManager({ tenantId }: { tenantId: string }) {
       <div className="flex justify-between items-center mb-8">
         <h3 className="text-sm font-bold text-slate-800 uppercase tracking-widest">Inserimento Strategico</h3>
         <label className={`cursor-pointer text-[10px] font-bold uppercase tracking-widest px-4 py-2 border rounded-md transition-colors ${loading ? 'opacity-50 cursor-not-allowed border-slate-200 text-slate-400' : 'border-emerald-200 text-emerald-600 bg-emerald-50 hover:bg-emerald-100'}`}>
-          {loading ? "Elaborazione..." : "Importa CSV"}
-          <input type="file" accept=".csv, .xlsx, .xls" className="hidden" ref={fileRef} onChange={handleCsvUpload} disabled={loading} />
+          {loading ? "Elaborazione..." : "Importa File"}
+          <input type="file" accept=".csv, .xlsx, .xls" className="hidden" ref={fileRef} onChange={handleFileUpload} disabled={loading} />
         </label>
       </div>
 
