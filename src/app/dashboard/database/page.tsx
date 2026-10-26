@@ -2,6 +2,7 @@ import { prisma } from "@/lib/prisma";
 import LeadManager from "@/app/dashboard/LeadManager";
 import TriggerButton from "@/app/dashboard/TriggerButton";
 import RfmSyncButton from "@/app/dashboard/RfmSyncButton";
+import EnrollButton from "@/components/EnrollButton";
 
 export const dynamic = 'force-dynamic';
 
@@ -51,7 +52,7 @@ export default async function DatabasePage() {
 
         {/* Manager Inserimento */}
         <div className="lg:col-span-1 h-full">
-          <LeadManager tenantId={tenant.id} />
+          <LeadManager tenantId={tenant.id} apiKey={tenant.apiKey} />
         </div>
 
         {/* Operazioni di Sistema */}
@@ -65,6 +66,7 @@ export default async function DatabasePage() {
           {/* I bottoni TriggerButton e RfmSyncButton si adatteranno se li hai modificati, o puoi usare la versione base chiara */}
           <RfmSyncButton tenantId={tenant.id} />
           <TriggerButton />
+          <EnrollButton apiKey={tenant.apiKey} />
         </div>
       </div>
     </div>

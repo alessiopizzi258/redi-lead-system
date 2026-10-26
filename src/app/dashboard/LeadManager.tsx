@@ -1,9 +1,9 @@
 "use client";
 
 import { useState, useRef } from "react";
-import { addSingleLead } from "./actions"; // Ho rimosso importCsvLeads, ora usiamo l'API diretta
+import { addSingleLead } from "./actions"; 
 
-export default function LeadManager({ tenantId }: { tenantId: string }) {
+export default function LeadManager({ tenantId, apiKey }: { tenantId: string, apiKey: string }) {
   const [loading, setLoading] = useState(false);
   const [message, setMessage] = useState<{ text: string; type: "error" | "success" } | null>(null);
   const formRef = useRef<HTMLFormElement>(null);
@@ -25,7 +25,6 @@ export default function LeadManager({ tenantId }: { tenantId: string }) {
     setLoading(false);
   }
 
-  // NUOVO MOTORE DI UPLOAD EXCEL / CSV
   async function handleFileUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -37,18 +36,17 @@ export default function LeadManager({ tenantId }: { tenantId: string }) {
     formData.append("file", file);
 
     try {
-      // Punta all'API Route che abbiamo ingegnerizzato prima per l'Excel
       const res = await fetch('/api/leads/import', {
         method: 'POST',
         headers: {
-          'x-tenant-id': tenantId // Passiamo l'ID per l'isolamento multi-tenant
+          'x-rls-api-key': apiKey // Autorizzazione blindata
         },
         body: formData
       });
 
       const data = await res.json();
 
-      if (!res.ok) throw new Error(data.error || "Upload fallito dal server");
+      if (!res.ok) throw new Error(data.message || "Upload fallito dal server");
       
       setMessage({ text: `Iniezione completata: ${data.added} aggiunti, ${data.skipped} saltati.`, type: "success" });
     } catch (err: any) {

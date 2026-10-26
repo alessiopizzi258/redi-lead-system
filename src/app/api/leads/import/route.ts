@@ -2,23 +2,25 @@ import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import * as xlsx from 'xlsx';
 
+export const dynamic = "force-dynamic";
+
 export async function POST(req: NextRequest) {
   try {
-    // 1. Autorizzazione (Da sostituire con la tua logica di sessione Auth)
-    const tenantId = req.headers.get('x-tenant-id'); 
-    if (!tenantId) {
-      return NextResponse.json({ error: "Unauthorized: Tenant ID mancante" }, { status: 401 });
-    }
+    // 1. Scudo di Sicurezza: Allineato all'Ingestion standard
+    const apiKey = req.headers.get("x-rls-api-key");
+    if (!apiKey) return NextResponse.json({ success: false, message: "Non autorizzato" }, { status: 401 });
 
-    // 2. Estrazione del file dal payload form-data
+    const tenant = await prisma.tenant.findUnique({ where: { apiKey } });
+    if (!tenant) return NextResponse.json({ success: false, message: "Credenziali Tenant non valide" }, { status: 403 });
+
+    // 2. Estrazione File in RAM
     const formData = await req.formData();
     const file = formData.get('file') as Blob | null;
 
     if (!file) {
-      return NextResponse.json({ error: "Nessun file fornito" }, { status: 400 });
+      return NextResponse.json({ success: false, message: "Nessun file fornito nel payload" }, { status: 400 });
     }
 
-    // 3. Lettura del file Excel direttamente in RAM (Zero disk I/O)
     const buffer = Buffer.from(await file.arrayBuffer());
     const workbook = xlsx.read(buffer, { type: 'buffer' });
     const sheetName = workbook.SheetNames[0];
@@ -27,7 +29,7 @@ export async function POST(req: NextRequest) {
     let added = 0;
     let skipped = 0;
 
-    // 4. Ingestion Massiva
+    // 3. Ingestion Massiva per il Nurturing Storico
     for (const row of data as any[]) {
       const email = row['EMAIL']?.toString().trim().toLowerCase();
       if (!email || !email.includes('@')) {
@@ -41,33 +43,37 @@ export async function POST(req: NextRequest) {
       const lastName = nameParts.slice(1).join(' ') || "";
 
       await prisma.profile.upsert({
-        where: { tenantId_email: { tenantId, email } },
+        where: { tenantId_email: { tenantId: tenant.id, email } },
         update: {
           firstName,
           lastName,
           phone: row['TELEFONO']?.toString().trim(),
           source: row['ORIGINE LEAD']?.toString().trim(),
-          problemDescription: row['NOTE LEAD']?.toString().trim()
+          problemDescription: row['NOTE LEAD']?.toString().trim(),
+          lastActivityAt: new Date()
         },
         create: {
-          tenantId,
+          tenantId: tenant.id,
           email,
           firstName,
           lastName,
           phone: row['TELEFONO']?.toString().trim(),
-          source: row['ORIGINE LEAD']?.toString().trim(),
+          source: row['ORIGINE LEAD']?.toString().trim() || "Importazione_Storico",
           problemDescription: row['NOTE LEAD']?.toString().trim(),
-          status: 'NURTURING', // Mappato direttamente per l'inseguimento
-          isVerified: true
+          segment: "Dormiente",
+          status: 'NURTURING', 
+          icpScore: 0,
+          isVerified: true,
+          lastActivityAt: new Date()
         }
       });
       added++;
     }
 
-    return NextResponse.json({ success: true, added, skipped });
+    return NextResponse.json({ success: true, added, skipped, message: "Iniezione completata." }, { status: 200 });
 
   } catch (error: any) {
-    console.error("❌ [Upload API Error]:", error.message);
-    return NextResponse.json({ error: "Errore interno del server" }, { status: 500 });
+    console.error("❌ [Mass Import Error]:", error.message);
+    return NextResponse.json({ success: false, message: "Errore interno del server" }, { status: 500 });
   }
 }
