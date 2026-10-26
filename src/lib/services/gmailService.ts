@@ -48,7 +48,7 @@ export async function sendViaGmailRotator(to: string, subject: string, htmlConte
 
     // 4. Fuoco!
     await transporter.sendMail({
-      from: `"Massimiliano Paolucci" <${sender.email}>`,
+      from: `"Scintilla Hub" <${sender.email}>`,
       to,
       subject,
       html: htmlContent
