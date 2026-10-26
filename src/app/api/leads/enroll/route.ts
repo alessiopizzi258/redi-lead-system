@@ -5,7 +5,14 @@ import IORedis from 'ioredis';
 
 export const dynamic = "force-dynamic";
 
+// Connessione con strategia "Fail-Fast" per evitare freeze del server
 const connection = new IORedis(process.env.REDIS_URL!, {
+  maxRetriesPerRequest: null,
+  connectTimeout: 5000,
+  retryStrategy(times) {
+    if (times > 3) return null; // Interrompe i tentativi dopo 3 fallimenti
+    return Math.min(times * 200, 1000);
+  },
   tls: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
 });
 
@@ -25,9 +32,14 @@ export async function POST(req: NextRequest) {
       return NextResponse.json({ success: false, message: "Sequenza non trovata." }, { status: 404 });
     }
 
-    // 1. SVEGLIA IL WORKER IN OGNI CASO (Il comando passa sempre)
-    const nurturingQueue = new Queue('nurturing-queue', { connection });
-    await nurturingQueue.add('start-campaigns', {}, { removeOnComplete: true });
+    // 1. SVEGLIA IL WORKER CON TIMEOUT PROTETTO
+    try {
+      const nurturingQueue = new Queue('nurturing-queue', { connection });
+      await nurturingQueue.add('start-campaigns', {}, { removeOnComplete: true });
+    } catch (redisError: any) {
+      console.error("❌ Errore critico Redis:", redisError.message);
+      return NextResponse.json({ success: false, message: "Connessione al motore Redis fallita. Controlla le chiavi." }, { status: 500 });
+    }
 
     // 2. Cerca nuovi lead da agganciare
     const unenrolledLeads = await prisma.profile.findMany({
@@ -39,9 +51,8 @@ export async function POST(req: NextRequest) {
       select: { id: true }
     });
 
-    // Se non ci sono nuovi lead, avvisa ma il worker è comunque partito
     if (unenrolledLeads.length === 0) {
-      return NextResponse.json({ success: true, count: 0, message: "Nessun nuovo lead, ma motore di invio forzato." }, { status: 200 });
+      return NextResponse.json({ success: true, count: 0, message: "Motore forzato. Nessun nuovo lead." }, { status: 200 });
     }
 
     // 3. Aggancia i nuovi lead
@@ -62,6 +73,6 @@ export async function POST(req: NextRequest) {
 
   } catch (error: any) {
     console.error("❌ [Enroll API Error]:", error.message);
-    return NextResponse.json({ success: false, message: "Errore interno" }, { status: 500 });
+    return NextResponse.json({ success: false, message: "Errore interno del server" }, { status: 500 });
   }
 }
