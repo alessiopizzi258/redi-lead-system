@@ -1,15 +1,11 @@
 generator client {
-  provider = "prisma-client-js"
+  provider        = "prisma-client-js"
   previewFeatures = ["driverAdapters"]
 }
 
 datasource db {
   provider = "postgresql"
 }
-
-// -----------------------------
-// ENUMS (RLS Specifics)
-// -----------------------------
 
 enum Urgency {
   HIGH
@@ -24,12 +20,16 @@ enum Role {
   C_LEVEL
   EMPLOYEE
   OTHER
+  // --- Estensione B2C / Residenziale (es. Scintilla Hub) ---
+  PRIVATE_HOMEOWNER
+  PRIVATE_TENANT
+  FAMILY_DECISION_MAKER
 }
 
 enum LeadStatus {
   PENDING_OTP
-  PENDING_VERIFICATION // <-- Aggiunto per l'isolamento dei lead Social
-  NURTURING            // <-- Aggiunto per il parcheggio dei lead non caldi
+  PENDING_VERIFICATION
+  NURTURING
   ACTIVE
   QUALIFIED
   DA_VERIFICARE_MANUALMENTE
@@ -37,11 +37,6 @@ enum LeadStatus {
   REJECTED
 }
 
-// -----------------------------
-// MODELS
-// -----------------------------
-
-// Livello 2 (OTP)
 model OtpToken {
   id        String   @id @default(cuid())
   token     String
@@ -54,80 +49,99 @@ model OtpToken {
 }
 
 model Tenant {
-  id             String          @id @default(uuid())
-  companyName    String
-  adminEmail     String?         @unique 
-  apiKey         String          @unique 
-  createdAt      DateTime        @default(now())
-  
-  sequences      Sequence[]
-  profiles       Profile[]
-  campaigns      Campaign[]
-  automationLogs AutomationLog[]
-  trackingEvents TrackingEvent[]
+  id                String   @id @default(uuid())
+  companyName       String
+  adminEmail        String?  @unique
+  apiKey            String   @unique
+  createdAt         DateTime @default(now())
+
+  // --- RLS Credits & Monetizzazione ---
+  credits           Int      @default(10)   // Crediti per sbloccare i lead QUALIFIED
+  autoUnlockLeads   Boolean  @default(true) // Scala automaticamente 1 credito alla consegna
+  qualificationThreshold Int @default(50)   // Soglia contrattuale personalizzabile per Tenant
+
+  // --- Algorithm Feeder (Meta CAPI & Google Ads) ---
+  metaPixelId       String?
+  metaCapiToken     String?
+  googleConversionUrl String?
+
+  // --- Connettore CRM Outbound ---
+  crmWebhookUrl     String?
+  crmWebhookSecret  String?
+
+  sequences         Sequence[]
+  profiles          Profile[]
+  campaigns         Campaign[]
+  automationLogs    AutomationLog[]
+  trackingEvents    TrackingEvent[]
 
   @@index([apiKey])
 }
 
 model Profile {
-  id              String     @id @default(uuid())
-  tenantId        String
-  email           String     
-  firstName       String?
-  lastName        String?   
-  phone           String?   
+  id                 String     @id @default(uuid())
+  tenantId           String
+  email              String
+  firstName          String?
+  lastName           String?
+  phone              String?
+  vatNumber          String?    // P.IVA per verifica VIES B2B
+  leadType           String     @default("B2B") // "B2B" o "B2C"
 
-  sequenceStates LeadSequenceState[]
-  
-  isVerified      Boolean    @default(false)
-  status          LeadStatus @default(PENDING_OTP)
-  
-  // --- Parametri RLS (Setaccio Algoritmico) ---
-  problemDescription String? @db.Text
+  // --- Sblocco tramite RLS Credits ---
+  isUnlocked         Boolean    @default(false)
+  unlockedAt         DateTime?
+
+  // --- Ritorno Esiti CRM (Ciclo di Taratura) ---
+  dealStatus         String?    // "CONTACTED", "APPOINTMENT", "WON", "LOST"
+  dealValue          Float?
+
+  sequenceStates     LeadSequenceState[]
+  isVerified         Boolean    @default(false)
+  status             LeadStatus @default(PENDING_OTP)
+
+  problemDescription String?    @db.Text
   urgency            Urgency?
   role               Role?
   budget             Float?
-  icpScore           Int       @default(0) // Punteggio matematico qualificazione
-  
-  // --- Metriche Operative & Tracking ---
-  industry        String?    
-  coherenceScore  Int        @default(0)
-  source          String?    
-  lastIp          String?    // Reverse lookup
-  fingerprint     String?    // Tracciamento passivo
+  icpScore           Int        @default(0)
 
-  passiveScore    Int       @default(0)
-  lastDecayedAt   DateTime?
-  
-  // --- Metriche RFM ---
-  recency         Int       @default(0)
-  frequency       Int       @default(0)
-  monetary        Int       @default(0)
-  segment         String    @default("Freddo")
-  
-  // --- Dati Operativi ARCH ---
-  arch_angle      String?
-  is_proxy        Boolean   @default(false)
-  contactCount    Int       @default(0)
-  totalClicks     Int       @default(0)
-  totalRevenue    Float     @default(0)
-  lastActivityAt  DateTime?
-  lastContactedAt DateTime?
-  
-  createdAt       DateTime  @default(now())
-  updatedAt       DateTime  @default(now()) @updatedAt
+  industry           String?
+  coherenceScore     Int        @default(0)
+  source             String?
+  lastIp             String?
+  fingerprint        String?
 
-  tenant          Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
-  otpTokens       OtpToken[]
-  automationLogs  AutomationLog[]
-  trackingEvents  TrackingEvent[]
-  webActivities   WebActivity[]   // Relazione con le attività web ombra
+  passiveScore       Int        @default(0)
+  lastDecayedAt      DateTime?
 
-  utmSource        String?
-  utmCampaign      String?
-  utmMedium        String?
+  recency            Int        @default(0)
+  frequency          Int        @default(0)
+  monetary           Int        @default(0)
+  segment            String     @default("Freddo")
 
-  @@unique([tenantId, email]) 
+  arch_angle         String?
+  is_proxy           Boolean    @default(false)
+  contactCount       Int        @default(0)
+  totalClicks        Int        @default(0)
+  totalRevenue       Float      @default(0)
+  lastActivityAt     DateTime?
+  lastContactedAt    DateTime?
+
+  createdAt          DateTime   @default(now())
+  updatedAt          DateTime   @default(now()) @updatedAt
+
+  tenant             Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  otpTokens          OtpToken[]
+  automationLogs     AutomationLog[]
+  trackingEvents     TrackingEvent[]
+  webActivities      WebActivity[]
+
+  utmSource          String?
+  utmCampaign        String?
+  utmMedium          String?
+
+  @@unique([tenantId, email])
 }
 
 model Sequence {

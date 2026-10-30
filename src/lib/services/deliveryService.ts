@@ -29,7 +29,7 @@ export class DeliveryService {
       });
 
       await transporter.sendMail({
-        from: `"Team" <${sender.email}>`, // Sicuro al 100%, usa solo l'email dal DB
+        from: `"Scintilla Hub" <${sender.email}>`, // Sicuro al 100%, usa solo l'email dal DB
         to,
         subject,
         html

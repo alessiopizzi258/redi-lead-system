@@ -1,75 +1,83 @@
 import { NextRequest, NextResponse } from "next/server";
 import { z } from "zod";
 import { prisma } from "@/lib/prisma";
-import { LeadStatus } from "@prisma/client";
+import { LeadStatus, Role } from "@prisma/client";
 import { Queue } from "bullmq";
 import IORedis from "ioredis";
+import { ValidationAndFeederService } from "@/lib/services/validationAndFeederService";
 
 export const dynamic = "force-dynamic";
 
-// ----------------------------------------------------------------------
-// 1. INIZIALIZZAZIONE CODE (BULLMQ + REDIS)
-// ----------------------------------------------------------------------
-// Il riutilizzo della connessione evita memory leak su istanze serverless
 const connection = new IORedis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: null,
-  tls: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : undefined
+  family: 4,
+  tls: process.env.REDIS_URL?.startsWith("rediss://") || process.env.NODE_ENV === "production"
+    ? { rejectUnauthorized: false }
+    : undefined
 });
-const leadQueue = new Queue('lead-processing', { connection });
+const leadQueue = new Queue("lead-processing", { connection });
 
-// ----------------------------------------------------------------------
-// 2. SCHEMA DI VALIDAZIONE BLINDATO (ZOD)
-// ----------------------------------------------------------------------
+// Schema Ibrido B2B + B2C (Non blocca le utenze private di Scintilla Hub)
 const ingestSchema = z.object({
   firstName: z.string().min(2, "Nome troppo corto").optional(),
   lastName: z.string().min(2, "Cognome troppo corto").optional(),
   email: z.string().email("Email non valida"),
   phone: z.string().optional(),
-  urgency: z.enum(["HIGH", "MEDIUM", "LOW"]),
-  role: z.enum(["OWNER", "MANAGER", "DIRECTOR", "C_LEVEL", "EMPLOYEE", "OTHER"]),
-  budget: z.number().nullable().optional(),
+  vatNumber: z.string().optional(),
+  leadType: z.enum(["B2B", "B2C"]).optional(),
+  urgency: z.enum(["HIGH", "MEDIUM", "LOW"]).default("MEDIUM"),
+  role: z.enum([
+    "OWNER", "MANAGER", "DIRECTOR", "C_LEVEL", "EMPLOYEE", "OTHER",
+    "PRIVATE_HOMEOWNER", "PRIVATE_TENANT", "FAMILY_DECISION_MAKER"
+  ]).optional().default("FAMILY_DECISION_MAKER"),
+  budget: z.number().nullable().optional(), // In B2C rappresenta la spesa bolletta mensile/annua
   problemDescription: z.string().optional(),
+  honeypot: z.string().optional(), // Campo trappola anti-bot (Fase 3 documento)
 });
 
 type IngestData = z.infer<typeof ingestSchema>;
 
-// ----------------------------------------------------------------------
-// 3. SETACCIO MATEMATICO (ICP SCORING ENGINE)
-// ----------------------------------------------------------------------
-function calculateICPScore(data: IngestData): number {
+function calculateHybridICPScore(data: IngestData, isB2C: boolean): number {
   let score = 0;
 
-  // Modulatore Urgenza (Max 40)
+  // 1. Modulatore Urgenza (Max 40)
   if (data.urgency === "HIGH") score += 40;
-  else if (data.urgency === "MEDIUM") score += 20;
+  else if (data.urgency === "MEDIUM") score += 25;
+  else score += 10;
 
-  // Modulatore Potere Decisionale (Max 30)
-  if (["OWNER", "C_LEVEL", "DIRECTOR"].includes(data.role)) score += 30;
-  else if (data.role === "MANAGER") score += 15;
+  if (isB2C) {
+    // --- LOGICA B2C (Scintilla Hub: Famiglie / Utenze Luce & Gas) ---
+    if (["PRIVATE_HOMEOWNER", "FAMILY_DECISION_MAKER", "OWNER"].includes(data.role)) {
+      score += 30; // Titolare di bolletta / decisore familiare
+    } else {
+      score += 20;
+    }
+    // Se ha indicato una spesa bolletta o ha lasciato il telefono verificabile
+    if ((data.budget && data.budget > 0) || (data.phone && data.phone.length >= 9)) {
+      score += 30;
+    }
+  } else {
+    // --- LOGICA B2B CLASSICA ---
+    if (["OWNER", "C_LEVEL", "DIRECTOR"].includes(data.role)) score += 30;
+    else if (data.role === "MANAGER") score += 15;
 
-  // Modulatore Capacità di Spesa (Max 30)
-  if (data.budget && data.budget > 0) score += 30;
+    if (data.budget && data.budget > 0) score += 30;
+  }
 
-  // Cap massimo per sicurezza costrutto
   return Math.min(score, 100);
 }
 
-// ----------------------------------------------------------------------
-// 4. ROUTE HANDLER POST
-// ----------------------------------------------------------------------
 export async function POST(req: NextRequest) {
   try {
-    // A. Autenticazione Server-Side (Nessun tenantId nel body, blindato tramite API Key)
-    const apiKey = req.headers.get("x-rls-api-key");
+    const apiKey = req.headers.get("x-rls-api-key")?.trim();
     if (!apiKey) return NextResponse.json({ success: false, message: "Non autorizzato" }, { status: 401 });
 
     const tenant = await prisma.tenant.findUnique({ where: { apiKey } });
     if (!tenant) return NextResponse.json({ success: false, message: "Credenziali Tenant non valide" }, { status: 403 });
 
-    // B. Parsing e Validazione Strict
     const body = await req.json();
     const parsed = ingestSchema.safeParse(body);
-    
+
     if (!parsed.success) {
       return NextResponse.json(
         { success: false, message: "Payload non conforme ai requisiti RLS", errors: parsed.error.format() },
@@ -79,76 +87,103 @@ export async function POST(req: NextRequest) {
 
     const data = parsed.data;
 
-    // C. Calcolo Algoritmico
-    const icpScore = calculateICPScore(data);
-    
-    // Condizionale di stato: scartiamo (NURTURING) chi non supera la soglia logica minima
-    const targetStatus = icpScore >= 50 ? LeadStatus.PENDING_OTP : LeadStatus.NURTURING;
+    // 1. CONTROLLO AFFIDABILITÀ ANTI-FAKE (Fase 3 Documento: Honeypot + DNS MX + Telefono)
+    if (data.honeypot && data.honeypot.length > 0) {
+      return NextResponse.json({ success: false, message: "Bot rilevato." }, { status: 403 });
+    }
 
-    // D. Persistenza Dati (Upsert per evitare duplicati logici)
+    const emailCheck = await ValidationAndFeederService.verifyRealEmail(data.email);
+    const phoneCheck = ValidationAndFeederService.verifyPhone(data.phone);
+
+    const isFakeOrAnomalous = !emailCheck.valid || !phoneCheck.valid;
+
+    // Rilevamento automatico B2C (se il Tenant è Scintilla Hub o l'email è personale senza P.IVA)
+    const isB2C =
+      data.leadType === "B2C" ||
+      tenant.companyName.toLowerCase().includes("scintilla") ||
+      (emailCheck.isPersonal && !data.vatNumber);
+
+    // 2. CALCOLO SCORING IBRIDO B2B/B2C
+    const icpScore = isFakeOrAnomalous ? 0 : calculateHybridICPScore(data, isB2C);
+    const threshold = tenant.qualificationThreshold || 50;
+
+    let targetStatus: LeadStatus = LeadStatus.NURTURING;
+    if (isFakeOrAnomalous) {
+      targetStatus = LeadStatus.ANOMALO; // Isolato in quarantena come da specifica
+    } else if (icpScore >= threshold) {
+      targetStatus = LeadStatus.PENDING_OTP;
+    }
+
+    // 3. SALVATAGGIO PROFILO
     const profile = await prisma.profile.upsert({
-      where: { tenantId_email: { tenantId: tenant.id, email: data.email } },
+      where: { tenantId_email: { tenantId: tenant.id, email: data.email.toLowerCase() } },
       update: {
         contactCount: { increment: 1 },
         lastActivityAt: new Date(),
+        phone: phoneCheck.normalized || data.phone,
+        vatNumber: data.vatNumber,
+        leadType: isB2C ? "B2C" : "B2B",
         urgency: data.urgency,
-        role: data.role,
+        role: data.role as Role,
         budget: data.budget,
         problemDescription: data.problemDescription,
-        icpScore: icpScore,
+        icpScore,
+        status: targetStatus,
       },
       create: {
         tenantId: tenant.id,
-        email: data.email,
+        email: data.email.toLowerCase(),
         firstName: data.firstName || "",
         lastName: data.lastName || "",
-        phone: data.phone || "",
+        phone: phoneCheck.normalized || data.phone || "",
+        vatNumber: data.vatNumber,
+        leadType: isB2C ? "B2C" : "B2B",
         source: "RLS_Algorithmic_Ingestion",
-        segment: "Freddo",
+        segment: icpScore >= 70 ? "Caldo" : icpScore >= threshold ? "Tiepido" : "Freddo",
         status: targetStatus,
         urgency: data.urgency,
-        role: data.role,
+        role: data.role as Role,
         budget: data.budget,
         problemDescription: data.problemDescription,
-        icpScore: icpScore,
+        icpScore,
         isVerified: false,
         lastActivityAt: new Date(),
       }
     });
 
-    // E. Esecuzione Asincrona (Offload su BullMQ)
-    // Selezioniamo solo i "Power Leads" per l'elaborazione prioritaria
-    if (icpScore > 70) {
-      await leadQueue.add(
-        "process-power-lead", 
-        { profileId: profile.id, tenantId: tenant.id, icpScore },
-        { 
-          attempts: 3, 
-          backoff: { type: "exponential", delay: 2000 },
-          removeOnComplete: true 
-        }
+    // 4. GENERAZIONE E INVIO AUTOMATICO OTP A 6 CIFRE (Se il lead merita qualificazione)
+    if (targetStatus === LeadStatus.PENDING_OTP) {
+      await ValidationAndFeederService.generateAndSendOtp(
+        profile.id,
+        profile.email,
+        profile.phone || undefined,
+        tenant.companyName
       );
-      console.log(`🚀 [RLS] Power Lead accodato su BullMQ. (Score: ${icpScore}, Email: ${data.email})`);
-    } else {
-      console.log(`⚖️ [RLS] Lead standard intercettato. (Score: ${icpScore}, Status: ${targetStatus})`);
     }
 
-    // F. Risposta istantanea (Latenza ottimizzata)
-    return NextResponse.json({ 
-      success: true, 
+    // 5. OFFLOAD SU CODA PER POWER LEADS
+    if (icpScore >= 70 && !isFakeOrAnomalous) {
+      await leadQueue.add(
+        "process-power-lead",
+        { profileId: profile.id, tenantId: tenant.id, icpScore },
+        { attempts: 3, backoff: { type: "exponential", delay: 2000 }, removeOnComplete: true }
+      );
+    }
+
+    return NextResponse.json({
+      success: !isFakeOrAnomalous,
       profileId: profile.id,
+      leadType: isB2C ? "B2C" : "B2B",
       status: targetStatus,
       score: icpScore,
-      message: "Lead intercettato e sottoposto a setaccio matematico."
+      otpSent: targetStatus === LeadStatus.PENDING_OTP,
+      message: isFakeOrAnomalous
+        ? `Contatto isolato in quarantena: ${emailCheck.reason || "Telefono non valido"}`
+        : "Lead intercettato, qualificato e codice OTP inviato."
     }, { status: 200 });
 
-  } catch (error: unknown) {
-    // Gestione errori controllata per evitare il collasso del processo
-    if (error instanceof Error) {
-      console.error("❌ [RLS Ingestion FATAL ERROR]:", error.message);
-    } else {
-      console.error("❌ [RLS Ingestion FATAL ERROR]: Unknown exception");
-    }
+  } catch (error: any) {
+    console.error("❌ [RLS Ingestion FATAL ERROR]:", error.message);
     return NextResponse.json({ success: false, message: "Errore interno del server" }, { status: 500 });
   }
 }

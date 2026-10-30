@@ -11,7 +11,7 @@ export default function HitlCard({ log }: { log: any }) {
   const [isSending, setIsSending] = useState(false);
   const [isRejecting, setIsRejecting] = useState(false);
 
-  const SENDER_EMAIL = "alessio@designlab-group.it"; // Aggiorna se necessario
+  const SENDER_EMAIL = "scintillahub092025@gmail.com"; // Aggiorna se necessario
 
   const handleApprove = async () => {
     setIsSending(true);
