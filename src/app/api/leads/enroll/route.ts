@@ -76,7 +76,7 @@ export async function POST(req: NextRequest) {
 
     const tenant = await prisma.tenant.findUnique({
       where: { apiKey: rawApiKey },
-      select: { id: true, apiKey: true, name: true }
+      select: { id: true, apiKey: true, companyName: true }
     });
 
     if (!tenant || !isValidApiKey(rawApiKey, tenant.apiKey)) {
