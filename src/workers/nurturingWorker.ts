@@ -1,4 +1,6 @@
 import 'dotenv/config';
+import dns from 'dns/promises';
+import tls from 'tls';
 import { Worker, Queue, Job } from 'bullmq';
 import IORedis from 'ioredis';
 import { buildScintillaTemplate } from '@/lib/utils/emailWrapper';
@@ -8,21 +10,202 @@ import { sendViaGmailRotator, resetDailyQuotasIfNeeded } from '@/lib/services/gm
 const connection = new IORedis(process.env.REDIS_URL!, {
   maxRetriesPerRequest: null,
   connectTimeout: 8000,
-  family: 4, // Forza IPv4 per evitare ENOTFOUND
+  family: 4, // Forza IPv4
   retryStrategy(times) {
-    return Math.min(times * 500, 5000); // Su Render deve riconnettersi sempre
+    return Math.min(times * 500, 5000);
   },
-  tls: process.env.REDIS_URL?.startsWith('rediss://') || process.env.NODE_ENV === 'production'
+  tls: process.env.REDIS_URL?.startsWith('rediss://')
     ? { rejectUnauthorized: false }
     : undefined
 });
 
-// Coda interna per l'auto-innesco (Cron autonomo senza dipendere da Vercel)
+// Coda interna per l'auto-innesco (Cron autonomo)
 const nurturingQueue = new Queue('nurturing-queue', { connection });
+
+// Domini temporanei o finti da bloccare prima dell'invio
+const DISPOSABLE_DOMAINS = new Set([
+  'mailinator.com', 'tempmail.com', '10minutemail.com', 'guerrillamail.com',
+  'yopmail.com', 'trashmail.com', 'getnada.com', 'temp-mail.org'
+]);
+
+/**
+ * SCUDO 1: Verifica rapida sintassi e record DNS MX prima di sprecare un invio SMTP
+ */
+async function preFlightEmailCheck(email: string): Promise<{ valid: boolean; reason?: string }> {
+  const clean = email.trim().toLowerCase();
+  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+  if (!emailRegex.test(clean)) {
+    return { valid: false, reason: 'Sintassi email malformata' };
+  }
+
+  const domain = clean.split('@')[1];
+  if (!domain || DISPOSABLE_DOMAINS.has(domain)) {
+    return { valid: false, reason: 'Dominio email temporaneo o non valido' };
+  }
+
+  try {
+    const mx = await dns.resolveMx(domain);
+    if (!mx || mx.length === 0) {
+      return { valid: false, reason: `Il dominio @${domain} non ha server di posta (MX)` };
+    }
+    return { valid: true };
+  } catch {
+    return { valid: false, reason: `Dominio @${domain} inesistente o scaduto (DNS NXDOMAIN)` };
+  }
+}
+
+/**
+ * Isola definitivamente un contatto che ha generato Hard Bounce o Message Blocked
+ */
+async function quarantineDeadLead(
+  profileId: string,
+  tenantId: string,
+  email: string,
+  subject: string,
+  reason: string
+) {
+  await prisma.$transaction([
+    prisma.profile.update({
+      where: { id: profileId },
+      data: {
+        status: 'REJECTED',
+        segment: 'Rimbalzato (Bounce)'
+      }
+    }),
+    prisma.leadSequenceState.updateMany({
+      where: { profileId },
+      data: {
+        isCompleted: true,
+        isUnsubscribed: true
+      }
+    }),
+    prisma.automationLog.create({
+      data: {
+        tenantId,
+        profileId,
+        emailAddress: email,
+        subject,
+        status: 'BOUNCED',
+        bounceHard: true,
+        errorMessage: reason
+      }
+    })
+  ]);
+  console.warn(`🛡️ [Bounce Shield] Contatto ${email} rimosso dalla sequenza e marcato REJECTED. Motivo: ${reason}`);
+}
+
+/**
+ * SCUDO 2: Scanner IMAP leggero (Zero dipendenze esterne).
+ * Controlla nella casella Gmail le notifiche di "Mail Delivery Subsystem" (Address not found / Message blocked)
+ * e disattiva automaticamente i contatti rimbalzati prima che il worker invii gli step successivi.
+ */
+async function scanGmailBouncesViaImap() {
+  const senders = await prisma.gmailSender.findMany({
+    where: { isActive: true }
+  });
+
+  for (const sender of senders) {
+    if (!sender.appPassword) continue;
+
+    await new Promise<void>((resolve) => {
+      const socket = tls.connect(993, sender.imapHost || 'imap.gmail.com', { rejectUnauthorized: false });
+      let buffer = '';
+      let step = 0;
+
+      const timeout = setTimeout(() => {
+        socket.destroy();
+        resolve();
+      }, 12000);
+
+      socket.on('data', async (chunk) => {
+        buffer += chunk.toString('utf8');
+
+        if (step === 0 && buffer.includes('* OK')) {
+          step = 1;
+          buffer = '';
+          const cleanPass = sender.appPassword.replace(/\s+/g, '');
+          socket.write(`A1 LOGIN "${sender.email}" "${cleanPass}"\r\n`);
+        } else if (step === 1 && (buffer.includes('A1 OK') || buffer.includes('A1 NO'))) {
+          if (buffer.includes('A1 NO')) {
+            clearTimeout(timeout);
+            socket.destroy();
+            return resolve();
+          }
+          step = 2;
+          buffer = '';
+          socket.write(`A2 SELECT INBOX\r\n`);
+        } else if (step === 2 && buffer.includes('A2 OK')) {
+          step = 3;
+          buffer = '';
+          // Cerca le email di errore provenienti da Mail Delivery Subsystem
+          socket.write(`A3 SEARCH FROM "mailer-daemon"\r\n`);
+        } else if (step === 3 && buffer.includes('A3 OK')) {
+          const match = buffer.match(/\* SEARCH ([0-9 ]+)/);
+          if (!match || !match[1].trim()) {
+            clearTimeout(timeout);
+            socket.write(`A5 LOGOUT\r\n`);
+            socket.destroy();
+            return resolve();
+          }
+          const ids = match[1].trim().split(/\s+/).slice(-25); // Controlla gli ultimi 25 bounce
+          step = 4;
+          buffer = '';
+          socket.write(`A4 FETCH ${ids.join(',')} (BODY.PEEK[TEXT])\r\n`);
+        } else if (step === 4 && buffer.includes('A4 OK')) {
+          const rawText = buffer;
+          clearTimeout(timeout);
+          socket.write(`A5 LOGOUT\r\n`);
+          socket.destroy();
+
+          // Estrae tutte le email citate nei messaggi di "Address not found" / "Message blocked"
+          const foundEmails = new Set<string>();
+          const regex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
+          let m;
+          while ((m = regex.exec(rawText)) !== null) {
+            const candidate = m[1].toLowerCase();
+            if (
+              candidate !== sender.email.toLowerCase() &&
+              !candidate.includes('google') &&
+              !candidate.includes('mailer-daemon') &&
+              !candidate.includes('scintillahub')
+            ) {
+              foundEmails.add(candidate);
+            }
+          }
+
+          if (foundEmails.size > 0) {
+            const bouncedProfiles = await prisma.profile.findMany({
+              where: {
+                email: { in: Array.from(foundEmails) },
+                status: { notIn: ['REJECTED', 'ANOMALO'] }
+              }
+            });
+
+            for (const prof of bouncedProfiles) {
+              await quarantineDeadLead(
+                prof.id,
+                prof.tenantId,
+                prof.email,
+                'Mail Delivery Subsystem (Bounce Rilevato)',
+                'Email rimbalzata (Address not found o Message blocked rilevato nella inbox mittente)'
+              );
+            }
+          }
+          resolve();
+        }
+      });
+
+      socket.on('error', () => {
+        clearTimeout(timeout);
+        resolve();
+      });
+    });
+  }
+}
 
 /**
  * Funzione che aggancia automaticamente eventuali nuovi lead alle sequenze attive
- * senza dover premere il bottone dalla Dashboard.
+ * escludendo i contatti già bruciati (REJECTED / ANOMALO).
  */
 async function autoEnrollNewLeads() {
   const activeSequences = await prisma.sequence.findMany({
@@ -61,13 +244,16 @@ const nurturingWorker = new Worker(
   async (job: Job) => {
     console.log(`🔄 [Nurturing Engine] Avvio ciclo automatico (Job: ${job.name})...`);
 
-    // 1. AUTO-RESET QUOTE GIORNALIERE (Se è passata la mezzanotte, azzera i contatori)
+    // 1. AUTO-RESET QUOTE GIORNALIERE
     await resetDailyQuotasIfNeeded();
 
-    // 2. AUTO-ISCRIZIONE NUOVI LEAD
+    // 2. SCANSIONE AUTOMATICA BOUNCE RICEVUTI SU GMAIL (Ferma subito gli "Address not found" e "Message blocked")
+    await scanGmailBouncesViaImap();
+
+    // 3. AUTO-ISCRIZIONE NUOVI LEAD
     await autoEnrollNewLeads();
 
-    // 3. Pesca le iscrizioni attive, non completate e non disiscritte
+    // 4. Pesca le iscrizioni attive, non completate e non disiscritte
     const activeEnrollments = await prisma.leadSequenceState.findMany({
       where: {
         isCompleted: false,
@@ -87,8 +273,8 @@ const nurturingWorker = new Worker(
     let sentCount = 0;
 
     for (const enrollment of activeEnrollments) {
-      // Un lead in QUALIFIED esce automaticamente dal Nurturing
-      if (enrollment.profile.status === 'QUALIFIED') {
+      // Se il profilo è QUALIFIED, REJECTED o ANOMALO, chiude subito la sequenza e non invia più nulla
+      if (['QUALIFIED', 'REJECTED', 'ANOMALO'].includes(enrollment.profile.status)) {
         await prisma.leadSequenceState.update({
           where: { id: enrollment.id },
           data: { isCompleted: true }
@@ -96,7 +282,7 @@ const nurturingWorker = new Worker(
         continue;
       }
 
-      // Identifica il prossimo Step (Step 0 -> Step 1 -> Step 2...)
+      // Identifica il prossimo Step
       const nextStepIndex = enrollment.sequence.emails.findIndex(
         e => e.stepNumber > enrollment.currentStep
       );
@@ -117,16 +303,29 @@ const nurturingWorker = new Worker(
         const targetDate = new Date(enrollment.lastEmailedAt);
         targetDate.setDate(targetDate.getDate() + nextEmail.delayDays);
 
-        // Se non è ancora maturato il tempo per questo contatto, passa al prossimo
         if (now < targetDate) continue;
+      }
+
+      const targetEmail = enrollment.profile.email.trim().toLowerCase();
+      const tenantId = enrollment.profile.tenantId;
+
+      // 5. CONTROLLO PREVENTIVO DNS MX (Evita di spedire a domini morti o inesistenti)
+      const dnsCheck = await preFlightEmailCheck(targetEmail);
+      if (!dnsCheck.valid) {
+        await quarantineDeadLead(
+          enrollment.profile.id,
+          tenantId,
+          targetEmail,
+          nextEmail.subject,
+          dnsCheck.reason || 'Dominio non valido'
+        );
+        continue;
       }
 
       try {
         const baseUrl = process.env.NEXT_PUBLIC_APP_URL || "https://tuodominio.it";
-        const tenantId = enrollment.profile.tenantId;
         const tenantName = enrollment.sequence.tenant?.companyName || "Scintilla Hub";
 
-        // Determina il nome mittente pulito (Mai più "Massimiliano Paolucci")
         const senderDisplayName = tenantName.includes("Scintilla")
           ? "Scintilla Hub"
           : tenantName;
@@ -156,63 +355,86 @@ const nurturingWorker = new Worker(
           `href="${baseUrl}/api/track/click?uid=${enrollment.profile.id}&tid=${tenantId}&url=$1"`
         );
 
-        // 4. Sparo tramite rotatore passando esplicitamente il Brand ("Scintilla Hub")
+        // 6. Sparo tramite rotatore
         await sendViaGmailRotator(
-          enrollment.profile.email,
+          targetEmail,
           nextEmail.subject,
           bodyHtml,
           senderDisplayName
         );
 
-        // 5. Aggiorna lo stato della sequenza per questo contatto
-        await prisma.leadSequenceState.update({
-          where: { id: enrollment.id },
-          data: {
-            currentStep: nextEmail.stepNumber,
-            lastEmailedAt: now
-          }
-        });
+        // 7. Aggiorna lo stato della sequenza e registra il log di successo
+        await prisma.$transaction([
+          prisma.leadSequenceState.update({
+            where: { id: enrollment.id },
+            data: {
+              currentStep: nextEmail.stepNumber,
+              lastEmailedAt: now
+            }
+          }),
+          prisma.automationLog.create({
+            data: {
+              tenantId,
+              profileId: enrollment.profile.id,
+              emailAddress: targetEmail,
+              subject: nextEmail.subject,
+              status: 'SENT'
+            }
+          })
+        ]);
 
         sentCount++;
-        console.log(`✅ [Nurturing] Inviato Step ${nextEmail.stepNumber} a ${enrollment.profile.email} (Mittente: ${senderDisplayName})`);
+        console.log(`✅ [Nurturing] Inviato Step ${nextEmail.stepNumber} a ${targetEmail} (Mittente: ${senderDisplayName})`);
 
       } catch (error: any) {
         const msg = error.message || "";
 
-        // 🛑 STOP INTELLIGENTE: Se gli account hanno esaurito i 100 invii giornalieri,
-        // NON ciclare sugli altri 50 contatti lanciando errori, ma metti in pausa fino al prossimo ciclo!
+        // 🛑 STOP INTELLIGENTE: Se gli account hanno esaurito i 100 invii giornalieri, metti in pausa
         if (msg.includes("superato il limite") || msg.includes("quarantena") || msg.includes("Nessuna casella")) {
           console.warn(`⏸️ [Auto-Throttling] Limite giornaliero raggiunto (${sentCount} inviate in questa sessione). Il motore va in pausa e riprenderà da solo al prossimo ciclo.`);
           break;
         }
 
-        console.error(`❌ [Nurturing Error] Impossibile inviare a ${enrollment.profile.email}:`, msg);
+        // 🛡️ QUARANTENA IMMEDIATA SE L'ERRORE SMTP È UN HARD BOUNCE (550, 553, 554, Address not found, Blocked)
+        const isPermanentBounce =
+          /550|551|552|553|554|no such user|user unknown|address not found|does not exist|invalid recipient|message blocked|rejected/i.test(msg);
+
+        if (isPermanentBounce) {
+          await quarantineDeadLead(
+            enrollment.profile.id,
+            tenantId,
+            targetEmail,
+            nextEmail.subject,
+            `SMTP Hard Bounce: ${msg}`
+          );
+          continue;
+        }
+
+        console.error(`❌ [Nurturing Error] Impossibile inviare a ${targetEmail}:`, msg);
       }
     }
 
     console.log(`🏁 [Nurturing Engine] Ciclo completato. Email inviate in questo turno: ${sentCount}`);
     return { success: true, sent: sentCount };
   },
-  { connection, concurrency: 1 } // Concurrency 1 fondamentale per rispettare i delay anti-spam
+  { connection, concurrency: 1 }
 );
 
 nurturingWorker.on('ready', async () => {
-  console.log('⚙️ [Nurturing Worker] ONLINE. Configurazione pilota automatico...');
+  console.log('⚙️ [Nurturing Worker] ONLINE. Configurazione pilota automatico + Bounce Shield...');
 
   try {
-    // 1. Crea un battito cardiaco automatico ogni 30 minuti
     await nurturingQueue.add(
       'autonomous-heartbeat',
       { mode: 'auto' },
       {
-        repeat: { every: 30 * 60 * 1000 }, // Ogni 30 minuti controlla quote, nuovi lead e follow-up
+        repeat: { every: 30 * 60 * 1000 },
         jobId: 'rls-autonomous-cron',
         removeOnComplete: true,
         removeOnFail: 10
       }
     );
 
-    // 2. Fai partire un ciclo immediato appena il server Render va online (senza cliccare dalla Dashboard)
     await nurturingQueue.add(
       'startup-run',
       { mode: 'startup' },
@@ -222,7 +444,7 @@ nurturingWorker.on('ready', async () => {
       }
     );
 
-    console.log('🚀 [Pilota Automatico] ATTIVO. Il worker controllerà e invierà le email da solo ogni 30 minuti.');
+    console.log('🚀 [Pilota Automatico] ATTIVO. Il worker controllerà bounce, quote e invierà le email da solo ogni 30 minuti.');
   } catch (err: any) {
     console.error('⚠️ Errore avvio pilota automatico:', err.message);
   }
