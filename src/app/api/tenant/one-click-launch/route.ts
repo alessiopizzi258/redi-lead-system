@@ -5,6 +5,7 @@ import IORedis from 'ioredis';
 import { prisma } from '@/lib/prisma';
 
 export const runtime = 'nodejs';
+export const dynamic = 'force-dynamic';
 
 function normalizeEmail(raw: unknown): string {
   return String(raw || '').trim().toLowerCase();
@@ -33,11 +34,8 @@ export async function POST(req: NextRequest) {
     const companyName = String(formData.get('companyName') || 'Nuovo Tenant').trim();
     const agentName = String(formData.get('agentName') || `Team ${companyName}`).trim();
 
-    const aiProvider = (String(formData.get('aiProvider') || 'OPENAI').toUpperCase() as 'OPENAI' | 'ANTHROPIC');
-    const aiModel = String(formData.get('aiModel') || 'gpt-4o-mini').trim();
-    const aiApiKey = String(formData.get('aiApiKey') || '').trim();
-    const aiMaxAutonomousSteps = Number(formData.get('aiMaxAutonomousSteps') || 7);
-    const aiDefaultDelayDays = Number(formData.get('aiDefaultDelayDays') || 2);
+    const maxAutonomousSteps = Number(formData.get('maxAutonomousSteps') || 5);
+    const defaultDelayDays = Number(formData.get('defaultDelayDays') || 2);
 
     const industryContext = String(formData.get('industryContext') || '').trim();
     const offerCatalog = String(formData.get('offerCatalog') || '').trim();
@@ -65,11 +63,8 @@ export async function POST(req: NextRequest) {
           companyName,
           apiKey: `rls_${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`,
           aiEnabled: true,
-          aiProvider,
-          aiModel,
-          ...(aiApiKey ? { aiApiKey } : {}),
-          aiMaxAutonomousSteps,
-          aiDefaultDelayDays
+          aiMaxAutonomousSteps: maxAutonomousSteps,
+          aiDefaultDelayDays: defaultDelayDays
         }
       });
     } else {
@@ -78,11 +73,8 @@ export async function POST(req: NextRequest) {
         data: {
           companyName: companyName || tenant.companyName,
           aiEnabled: true,
-          aiProvider,
-          aiModel,
-          ...(aiApiKey ? { aiApiKey } : {}),
-          aiMaxAutonomousSteps,
-          aiDefaultDelayDays
+          aiMaxAutonomousSteps: maxAutonomousSteps,
+          aiDefaultDelayDays: defaultDelayDays
         }
       });
     }
@@ -146,11 +138,11 @@ export async function POST(req: NextRequest) {
       sequence = await prisma.sequence.create({
         data: {
           tenantId: tenant.id,
-          name: `AI Autopilot - ${tenant.companyName}`,
-          description: 'Sequenza dinamica multi-step gestita integralmente da AI',
+          name: `Autopilot Nativo - ${tenant.companyName}`,
+          description: 'Sequenza automatica deterministica multi-step',
           isActive: true,
           useAiEngine: true,
-          maxSteps: aiMaxAutonomousSteps
+          maxSteps: maxAutonomousSteps
         }
       });
     } else {
@@ -159,7 +151,7 @@ export async function POST(req: NextRequest) {
         data: {
           isActive: true,
           useAiEngine: true,
-          maxSteps: aiMaxAutonomousSteps
+          maxSteps: maxAutonomousSteps
         }
       });
     }

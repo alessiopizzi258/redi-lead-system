@@ -16,23 +16,20 @@ export default function OneClickAutopilotPage() {
   const [imapPort, setImapPort] = useState(993);
   const [dailyLimit, setDailyLimit] = useState(90);
 
-  const [aiProvider, setAiProvider] = useState("OPENAI");
-  const [aiModel, setAiModel] = useState("gpt-4o-mini");
-  const [aiApiKey, setAiApiKey] = useState("");
-  const [aiMaxAutonomousSteps, setAiMaxAutonomousSteps] = useState(7);
-  const [aiDefaultDelayDays, setAiDefaultDelayDays] = useState(2);
+  const [maxAutonomousSteps, setMaxAutonomousSteps] = useState(4);
+  const [defaultDelayDays, setDefaultDelayDays] = useState(2);
 
   const [industryContext, setIndustryContext] = useState(
     "Noleggio a Lungo Termine di autovetture nuove per privati con busta paga a tempo indeterminato e Partite IVA."
   );
   const [offerCatalog, setOfferCatalog] = useState(
-    "1) Fiat 500 Hybrid Icon: 267€/mese + IVA (36 mesi, 30.000 km, anticipo 2.000€)\n2) Fiat Grande Panda 1.2 100cv Icon: 269€/mese + IVA (48 mesi, 60.000 km, anticipo 2.000€)\n3) Kia Stonic 1.0 T-GDI 100cv Urban: 310€/mese + IVA (ZERO ANTICIPO, 48 mesi, 100.000 km)\n4) Renault Twingo Evolution Urban: 305€/mese + IVA (48 mesi, 100.000 km, anticipo 2.500€)"
+    "Fiat 500 Hybrid Icon: 267€/mese + IVA (36 mesi, 30.000 km, anticipo 2.000€)\nFiat Grande Panda 1.2 100cv Icon: 269€/mese + IVA (48 mesi, 60.000 km, anticipo 2.000€)\nKia Stonic 1.0 T-GDI 100cv Urban: 310€/mese + IVA (ZERO ANTICIPO, 48 mesi, 100.000 km)\nRenault Twingo Evolution Urban: 305€/mese + IVA (48 mesi, 100.000 km, anticipo 2.500€)"
   );
   const [qualificationCriteria, setQualificationCriteria] = useState(
-    "Contratto a Tempo Indeterminato oppure Partita IVA attiva da almeno 2 anni, nessuna segnalazione in CRIF o Centrale Rischi, interesse concreto per una rata mensile tra 260€ e 400€."
+    "Contratto a Tempo Indeterminato oppure Partita IVA attiva da almeno 2 anni, assenza di segnalazioni CRIF, interesse per rata mensile tra 260€ e 400€."
   );
   const [disqualifyingRules, setDisqualifyingRules] = useState(
-    "Segnalati CRIF, cattivi pagatori, protestati, pignoramenti, disoccupati, contratti a termine senza garante solido, persone non interessate."
+    "crif, segnalato, protestato, pignoramento, cattivo pagatore, disoccupato, senza busta paga, non interessa"
   );
 
   const [databaseFile, setDatabaseFile] = useState<File | null>(null);
@@ -47,10 +44,8 @@ export default function OneClickAutopilotPage() {
         if (data?.tenantId) {
           setTenantId(data.tenantId);
           setCompanyName(data.companyName || "Scintilla Hub");
-          setAiProvider(data.aiProvider || "OPENAI");
-          setAiModel(data.aiModel || "gpt-4o-mini");
-          setAiMaxAutonomousSteps(data.aiMaxAutonomousSteps || 7);
-          setAiDefaultDelayDays(data.aiDefaultDelayDays || 2);
+          setMaxAutonomousSteps(data.aiMaxAutonomousSteps || 4);
+          setDefaultDelayDays(data.aiDefaultDelayDays || 2);
           if (data.config) {
             setAgentName(data.config.agentName || "Team Scintilla Rent");
             setIndustryContext(data.config.industryContext || industryContext);
@@ -82,11 +77,8 @@ export default function OneClickAutopilotPage() {
       fd.append("imapHost", imapHost);
       fd.append("imapPort", String(imapPort));
       fd.append("dailyLimit", String(dailyLimit));
-      fd.append("aiProvider", aiProvider);
-      fd.append("aiModel", aiModel);
-      fd.append("aiApiKey", aiApiKey);
-      fd.append("aiMaxAutonomousSteps", String(aiMaxAutonomousSteps));
-      fd.append("aiDefaultDelayDays", String(aiDefaultDelayDays));
+      fd.append("maxAutonomousSteps", String(maxAutonomousSteps));
+      fd.append("defaultDelayDays", String(defaultDelayDays));
       fd.append("industryContext", industryContext);
       fd.append("offerCatalog", offerCatalog);
       fd.append("qualificationCriteria", qualificationCriteria);
@@ -108,7 +100,7 @@ export default function OneClickAutopilotPage() {
       } else {
         setTenantId(data.tenantId);
         setResultMsg(
-          `SISTEMA AVVIATO: ${data.importedLeadsCount} contatti caricati, ${data.enrolledLeadsCount} inseriti nel flusso AI e coda di invio attivata.`
+          `MOTORE NATIVO AVVIATO: ${data.importedLeadsCount} contatti caricati, ${data.enrolledLeadsCount} inseriti in coda e worker attivato.`
         );
       }
     } catch (err: any) {
@@ -122,9 +114,9 @@ export default function OneClickAutopilotPage() {
     <div className="max-w-5xl mx-auto p-8 bg-white text-slate-900">
       <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 border-b pb-4 gap-4">
         <div>
-          <h1 className="text-2xl font-bold tracking-tight">Console One-Click AI Autopilot</h1>
+          <h1 className="text-2xl font-bold tracking-tight">Console One-Click Autopilot Nativo</h1>
           <p className="text-xs text-slate-500 mt-1">
-            1. Carica Database CSV/XLSX • 2. Imposta Email (Gmail/Dominio) • 3. Inserisci Cosa Vendono • 4. Clicca OK
+            1. Carica Database • 2. Imposta Email (Gmail/Dominio) • 3. Inserisci Cosa Vendono • 4. Clicca OK
           </p>
         </div>
         <div className="flex gap-2">
@@ -152,12 +144,12 @@ export default function OneClickAutopilotPage() {
 
         <div className="p-6 border border-slate-200 rounded-lg bg-slate-50/50 space-y-4">
           <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-700">
-            2. Configura Casella Email Mittente & Ricezione Risposte (Gmail o Dominio Custom)
+            2. Imposta Email Mittente & Lettura Risposte (Gmail o Dominio)
           </h2>
 
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Tipo Provider</label>
+              <label className="block text-xs font-bold uppercase mb-1">Tipo Casella</label>
               <select
                 value={senderProvider}
                 onChange={e => {
@@ -178,10 +170,10 @@ export default function OneClickAutopilotPage() {
             </div>
 
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Email Mittente</label>
+              <label className="block text-xs font-bold uppercase mb-1">Indirizzo Email</label>
               <input
                 type="email"
-                placeholder="commerciale@azienda.it"
+                placeholder="info@azienda.it"
                 value={senderEmail}
                 onChange={e => setSenderEmail(e.target.value)}
                 className="w-full border p-2.5 rounded text-sm bg-white"
@@ -189,7 +181,7 @@ export default function OneClickAutopilotPage() {
             </div>
 
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">App Password / Password SMTP</label>
+              <label className="block text-xs font-bold uppercase mb-1">App Password / Password</label>
               <input
                 type="password"
                 placeholder="xxxx xxxx xxxx xxxx"
@@ -254,12 +246,12 @@ export default function OneClickAutopilotPage() {
 
         <div className="p-6 border border-slate-200 rounded-lg bg-slate-50/50 space-y-4">
           <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-700">
-            3. Cosa Vendono, Catalogo Prezzi e Regole di Qualifica AI
+            3. Inserisci Cosa Vendono, Prezzi e Regole di Filtro Automatico
           </h2>
 
-          <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+          <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Nome Azienda (Tenant)</label>
+              <label className="block text-xs font-bold uppercase mb-1">Nome Azienda</label>
               <input
                 type="text"
                 value={companyName}
@@ -268,7 +260,7 @@ export default function OneClickAutopilotPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Firma Agente nelle Email</label>
+              <label className="block text-xs font-bold uppercase mb-1">Firma Mittente</label>
               <input
                 type="text"
                 value={agentName}
@@ -277,29 +269,27 @@ export default function OneClickAutopilotPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Motore AI & Step Massimi</label>
-              <div className="flex gap-2">
-                <select
-                  value={aiProvider}
-                  onChange={e => setAiProvider(e.target.value)}
-                  className="w-1/2 border p-2.5 rounded text-sm bg-white"
-                >
-                  <option value="OPENAI">OpenAI</option>
-                  <option value="ANTHROPIC">Anthropic</option>
-                </select>
-                <input
-                  type="number"
-                  value={aiMaxAutonomousSteps}
-                  onChange={e => setAiMaxAutonomousSteps(Number(e.target.value))}
-                  className="w-1/2 border p-2.5 rounded text-sm bg-white"
-                  title="Step massimi di email"
-                />
-              </div>
+              <label className="block text-xs font-bold uppercase mb-1">Numero Step Sequenza</label>
+              <input
+                type="number"
+                value={maxAutonomousSteps}
+                onChange={e => setMaxAutonomousSteps(Number(e.target.value))}
+                className="w-full border p-2.5 rounded text-sm bg-white"
+              />
+            </div>
+            <div>
+              <label className="block text-xs font-bold uppercase mb-1">Giorni di Attesa tra Step</label>
+              <input
+                type="number"
+                value={defaultDelayDays}
+                onChange={e => setDefaultDelayDays(Number(e.target.value))}
+                className="w-full border p-2.5 rounded text-sm bg-white"
+              />
             </div>
           </div>
 
           <div>
-            <label className="block text-xs font-bold uppercase mb-1">Cosa Vendono (Settore e Posizionamento)</label>
+            <label className="block text-xs font-bold uppercase mb-1">Cosa Vendono (Descrizione Servizio/Prodotto)</label>
             <textarea
               rows={2}
               value={industryContext}
@@ -309,7 +299,7 @@ export default function OneClickAutopilotPage() {
           </div>
 
           <div>
-            <label className="block text-xs font-bold uppercase mb-1">Catalogo Offerte / Prezzi / Condizioni</label>
+            <label className="block text-xs font-bold uppercase mb-1">Catalogo Offerte e Prezzi (1 per riga)</label>
             <textarea
               rows={4}
               value={offerCatalog}
@@ -321,7 +311,7 @@ export default function OneClickAutopilotPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-bold uppercase mb-1 text-emerald-700">
-                Requisiti Obbligatori per Passare il Lead al Venditore
+                Requisiti Richiesti (Mostrati nelle email)
               </label>
               <textarea
                 rows={3}
@@ -332,7 +322,7 @@ export default function OneClickAutopilotPage() {
             </div>
             <div>
               <label className="block text-xs font-bold uppercase mb-1 text-red-700">
-                Chi Scartare Subito in Automatico (es. CRIF / Senza Requisiti)
+                Parole Chiave di Scarto Automatico (separate da virgola)
               </label>
               <textarea
                 rows={3}
@@ -349,7 +339,7 @@ export default function OneClickAutopilotPage() {
           disabled={isLaunching}
           className="w-full py-4 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold uppercase tracking-widest rounded-lg shadow-lg disabled:opacity-50"
         >
-          {isLaunching ? "Configurazione e Avvio Motore in corso..." : "OK — SALVA, CARICA DATABASE E AVVIA TUTTO IN AUTOMATICO"}
+          {isLaunching ? "Avvio in corso..." : "OK — CARICA DATABASE E AVVIA TUTTO IN AUTOMATICO"}
         </button>
 
         {resultMsg && (

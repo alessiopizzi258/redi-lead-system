@@ -1,100 +1,40 @@
 import 'dotenv/config';
-import dns from 'dns/promises';
-import { ImapFlow } from 'imapflow';
 import { Worker, Queue, Job } from 'bullmq';
 import IORedis from 'ioredis';
-import { buildScintillaTemplate } from '@/lib/utils/emailWrapper';
+import dns from 'dns';
+import { ImapFlow } from 'imapflow';
 import { prisma } from '@/lib/prisma';
 import { sendViaGmailRotator, resetDailyQuotasIfNeeded } from '@/lib/services/gmailService';
-import { generateAutonomousStepOrReply } from '@/lib/services/aiAutonomousEngine';
+import { generateNativeStepEmail, evaluateLeadReplyNative } from '@/lib/services/aiAutonomousEngine';
 
-const connection = new IORedis(process.env.REDIS_URL!, {
+const redisUrl = process.env.REDIS_URL || 'redis://127.0.0.1:6379';
+
+const connection = new IORedis(redisUrl, {
   maxRetriesPerRequest: null,
-  connectTimeout: 8000,
+  connectTimeout: 10000,
   family: 4,
-  retryStrategy(times) {
-    return Math.min(times * 500, 5000);
-  },
-  tls: process.env.REDIS_URL?.startsWith('rediss://')
-    ? { rejectUnauthorized: false }
-    : undefined
+  tls: redisUrl.startsWith('rediss://') ? { rejectUnauthorized: false } : undefined
 });
 
 const nurturingQueue = new Queue('nurturing-queue', { connection });
 
-const DISPOSABLE_DOMAINS = new Set([
-  'mailinator.com', 'tempmail.com', '10minutemail.com', 'guerrillamail.com',
-  'yopmail.com', 'trashmail.com', 'getnada.com', 'temp-mail.org', 'gmail.it'
-]);
-
-async function preFlightEmailCheck(email: string): Promise<{ valid: boolean; reason?: string }> {
-  const clean = email.trim().toLowerCase();
-  const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
-  if (!emailRegex.test(clean)) {
-    return { valid: false, reason: 'Sintassi email malformata' };
-  }
-
-  const domain = clean.split('@')[1];
-  if (!domain || DISPOSABLE_DOMAINS.has(domain)) {
-    return { valid: false, reason: 'Dominio email temporaneo o non valido' };
-  }
-
+async function hasValidMxRecord(email: string): Promise<boolean> {
+  const domain = email.split('@')[1]?.trim().toLowerCase();
+  if (!domain || domain === 'gmail.it') return false;
   try {
-    const mx = await dns.resolveMx(domain);
-    if (!mx || mx.length === 0) {
-      return { valid: false, reason: `Il dominio @${domain} non ha record MX` };
-    }
-    return { valid: true };
+    const records = await dns.promises.resolveMx(domain);
+    return Array.isArray(records) && records.length > 0;
   } catch {
-    return { valid: false, reason: `Dominio @${domain} inesistente (NXDOMAIN)` };
+    return false;
   }
 }
 
-async function quarantineDeadLead(
-  profileId: string,
-  tenantId: string,
-  email: string,
-  subject: string,
-  reason: string
-) {
-  await prisma.$transaction([
-    prisma.profile.update({
-      where: { id: profileId },
-      data: {
-        status: 'REJECTED',
-        segment: 'Squalificato',
-        aiSummary: reason
-      }
-    }),
-    prisma.leadSequenceState.updateMany({
-      where: { profileId },
-      data: {
-        isCompleted: true,
-        isUnsubscribed: true
-      }
-    }),
-    prisma.automationLog.create({
-      data: {
-        tenantId,
-        profileId,
-        emailAddress: email,
-        subject,
-        status: 'BOUNCED',
-        bounceHard: true,
-        errorMessage: reason
-      }
-    })
-  ]);
-}
-
-async function processInboxBouncesAndReplies() {
-  const senders = await prisma.gmailSender.findMany({
+async function scanImapRepliesAndBounces() {
+  const activeSenders = await prisma.gmailSender.findMany({
     where: { isActive: true }
   });
 
-  for (const sender of senders) {
-    if (!sender.appPassword) continue;
-
+  for (const sender of activeSenders) {
     const client = new ImapFlow({
       host: sender.imapHost || 'imap.gmail.com',
       port: sender.imapPort || 993,
@@ -111,409 +51,233 @@ async function processInboxBouncesAndReplies() {
       const lock = await client.getMailboxLock('INBOX');
 
       try {
-        const sinceDate = new Date(Date.now() - 3 * 24 * 60 * 60 * 1000);
-        const uids = await client.search({ since: sinceDate, seen: false });
+        const unseenUids = await client.search({ seen: false });
+        if (unseenUids && unseenUids.length > 0) {
+          for (const uid of unseenUids.slice(-30)) {
+            const msg = await client.fetchOne(uid, { envelope: true, source: true });
+            if (!msg || !msg.envelope) continue;
 
-        if (uids && uids.length > 0) {
-          for await (const msg of client.fetch(uids.slice(-40), {
-            envelope: true,
-            source: true,
-            uid: true
-          })) {
-            const fromAddress = msg.envelope?.from?.[0]?.address?.toLowerCase() || '';
-            const subject = msg.envelope?.subject || '';
-            const rawSource = msg.source?.toString('utf8') || '';
-            const msgId = msg.envelope?.messageId || `imap-${sender.id}-${msg.uid}`;
+            const fromAddress = msg.envelope.from?.[0]?.address?.toLowerCase() || '';
+            const subject = (msg.envelope.subject || '').toLowerCase();
+            const rawSource = msg.source ? msg.source.toString('utf8') : '';
 
+            // 1. Intercettazione Hard Bounce (Mailer-Daemon)
             if (
               fromAddress.includes('mailer-daemon') ||
               fromAddress.includes('postmaster') ||
-              /delivery status notification|undeliverable|address not found|message blocked|failure notice/i.test(subject)
+              subject.includes('delivery status notification') ||
+              subject.includes('undeliverable') ||
+              subject.includes('failure notice')
             ) {
-              const regex = /([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})/g;
-              const candidates = new Set<string>();
-              let m;
-              while ((m = regex.exec(rawSource)) !== null) {
-                const emailFound = m[1].toLowerCase();
-                if (
-                  emailFound !== sender.email.toLowerCase() &&
-                  !emailFound.includes('mailer-daemon') &&
-                  !emailFound.includes('google')
-                ) {
-                  candidates.add(emailFound);
-                }
-              }
+              const emailMatch = rawSource.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i) ||
+                                 rawSource.match(/<([^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>/);
+              const bouncedEmail = emailMatch?.[1]?.trim().toLowerCase();
 
-              if (candidates.size > 0) {
-                const bouncedProfiles = await prisma.profile.findMany({
-                  where: {
-                    email: { in: Array.from(candidates) },
-                    status: { notIn: ['REJECTED', 'ANOMALO'] }
+              if (bouncedEmail) {
+                await prisma.profile.updateMany({
+                  where: { email: bouncedEmail },
+                  data: { status: 'ANOMALO', segment: 'Hard Bounce' }
+                });
+                await prisma.leadSequenceState.updateMany({
+                  where: { profile: { email: bouncedEmail } },
+                  data: { isCompleted: true, isUnsubscribed: true }
+                });
+              }
+              await client.messageFlagsAdd(uid, ['\\Seen']);
+              continue;
+            }
+
+            // 2. Valutazione nativa della risposta di un Lead
+            if (fromAddress) {
+              const profile = await prisma.profile.findFirst({
+                where: { email: fromAddress },
+                include: { tenant: { include: { aiAgentConfig: true } } }
+              });
+
+              if (profile) {
+                const evaluation = evaluateLeadReplyNative(rawSource, {
+                  companyName: profile.tenant?.companyName,
+                  agentName: profile.tenant?.aiAgentConfig?.agentName,
+                  qualificationCriteria: profile.tenant?.aiAgentConfig?.qualificationCriteria,
+                  disqualifyingRules: profile.tenant?.aiAgentConfig?.disqualifyingRules
+                });
+
+                await prisma.profile.update({
+                  where: { id: profile.id },
+                  data: {
+                    status: evaluation.status,
+                    segment: evaluation.segment,
+                    icpScore: Math.max(0, Math.min(100, (profile.icpScore || 35) + evaluation.icpScoreDelta)),
+                    lastContactedAt: new Date()
                   }
                 });
 
-                for (const prof of bouncedProfiles) {
-                  await quarantineDeadLead(
-                    prof.id,
-                    prof.tenantId,
-                    prof.email,
-                    'Bounce Rilevato via IMAP',
-                    'Hard Bounce / Indirizzo inesistente o bloccato'
-                  );
+                if (evaluation.status === 'REJECTED' || evaluation.status === 'QUALIFIED') {
+                  await prisma.leadSequenceState.updateMany({
+                    where: { profileId: profile.id },
+                    data: { isCompleted: true }
+                  });
+                }
+
+                if (evaluation.status === 'QUALIFIED' && evaluation.autoReplyHtml) {
+                  try {
+                    await sendViaGmailRotator(
+                      profile.email,
+                      `Re: ${msg.envelope.subject || 'Richiesta'}`,
+                      evaluation.autoReplyHtml,
+                      profile.tenant?.aiAgentConfig?.agentName || profile.tenant?.companyName || 'Team Commerciale',
+                      profile.tenantId
+                    );
+                  } catch {}
                 }
               }
-
-              await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
-              continue;
+              await client.messageFlagsAdd(uid, ['\\Seen']);
             }
-
-            const existingMsg = await prisma.aIConversationMessage.findUnique({
-              where: { messageId: msgId }
-            });
-            if (existingMsg) {
-              await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
-              continue;
-            }
-
-            const profile = await prisma.profile.findFirst({
-              where: { email: { equals: fromAddress, mode: 'insensitive' } },
-              include: { tenant: true }
-            });
-
-            if (!profile) {
-              await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
-              continue;
-            }
-
-            const plainBodyMatch = rawSource.split(/\r?\n\r?\n/).slice(1).join('\n');
-            const cleanReply = plainBodyMatch
-              .replace(/<[^>]+>/g, ' ')
-              .replace(/=\r?\n/g, '')
-              .slice(0, 1800)
-              .trim();
-
-            await prisma.aIConversationMessage.create({
-              data: {
-                tenantId: profile.tenantId,
-                profileId: profile.id,
-                role: 'USER',
-                subject,
-                content: cleanReply,
-                messageId: msgId
-              }
-            });
-
-            const aiDecision = await generateAutonomousStepOrReply({
-              tenantId: profile.tenantId,
-              profileId: profile.id,
-              stepNumber: (profile.contactCount || 1) + 1,
-              incomingReplyText: cleanReply,
-              fallbackSubject: `Re: ${subject}`
-            });
-
-            const updatedScore = Math.max(0, Math.min(200, profile.icpScore + aiDecision.icpScoreDelta));
-
-            await prisma.profile.update({
-              where: { id: profile.id },
-              data: {
-                status: aiDecision.newStatus,
-                segment: aiDecision.newSegment,
-                icpScore: updatedScore,
-                aiSummary: aiDecision.qualificationSummary,
-                financialClean: aiDecision.financialClean ?? profile.financialClean,
-                employmentType: aiDecision.employmentType ?? profile.employmentType,
-                lastActivityAt: new Date()
-              }
-            });
-
-            if (aiDecision.stopSequence || ['QUALIFIED', 'REJECTED'].includes(aiDecision.newStatus)) {
-              await prisma.leadSequenceState.updateMany({
-                where: { profileId: profile.id },
-                data: { isCompleted: true }
-              });
-            }
-
-            if (aiDecision.bodyText && aiDecision.bodyText.trim().length > 5 && aiDecision.newStatus !== 'REJECTED') {
-              const senderName = profile.tenant.companyName;
-              const htmlReply = profile.tenant.companyName.toLowerCase().includes('scintilla')
-                ? buildScintillaTemplate(aiDecision.bodyText)
-                : `<div style="font-family:Arial,sans-serif;font-size:14px;color:#111;">${aiDecision.bodyText.replace(/\n/g, '<br/>')}</div>`;
-
-              await sendViaGmailRotator(profile.email, aiDecision.subject, htmlReply, senderName);
-
-              await prisma.aIConversationMessage.create({
-                data: {
-                  tenantId: profile.tenantId,
-                  profileId: profile.id,
-                  role: 'ASSISTANT',
-                  subject: aiDecision.subject,
-                  content: aiDecision.bodyText,
-                  inReplyTo: msgId
-                }
-              });
-            }
-
-            await client.messageFlagsAdd(msg.uid, ['\\Seen'], { uid: true });
           }
         }
       } finally {
         lock.release();
       }
-
       await client.logout();
     } catch (err: any) {
-      console.error(`⚠️ [IMAP Listener Error] (${sender.email}):`, err.message);
+      console.error(`[IMAP] Errore scansione su ${sender.email}:`, err.message);
     }
   }
 }
 
-async function autoEnrollNewLeads() {
-  const activeSequences = await prisma.sequence.findMany({
-    where: { isActive: true }
+async function processAutonomousNurturingCycle() {
+  await resetDailyQuotasIfNeeded();
+  await scanImapRepliesAndBounces();
+
+  const dueStates = await prisma.leadSequenceState.findMany({
+    where: {
+      isCompleted: false,
+      isUnsubscribed: false,
+      nextActionAt: { lte: new Date() }
+    },
+    include: {
+      profile: {
+        include: {
+          tenant: {
+            include: { aiAgentConfig: true }
+          }
+        }
+      },
+      sequence: true
+    },
+    take: 25
   });
 
-  for (const seq of activeSequences) {
-    const unenrolledLeads = await prisma.profile.findMany({
-      where: {
-        tenantId: seq.tenantId,
-        status: { notIn: ['REJECTED', 'ANOMALO', 'QUALIFIED'] },
-        sequenceStates: { none: { sequenceId: seq.id } }
-      },
-      select: { id: true }
+  for (const state of dueStates) {
+    const profile = state.profile;
+    const tenant = profile.tenant;
+    const config = tenant?.aiAgentConfig;
+
+    if (!profile?.email || ['REJECTED', 'ANOMALO', 'QUALIFIED'].includes(profile.status)) {
+      await prisma.leadSequenceState.update({
+        where: { id: state.id },
+        data: { isCompleted: true }
+      });
+      continue;
+    }
+
+    const mxValid = await hasValidMxRecord(profile.email);
+    if (!mxValid) {
+      await prisma.$transaction([
+        prisma.profile.update({
+          where: { id: profile.id },
+          data: { status: 'REJECTED', segment: 'Dominio Inesistente (MX)' }
+        }),
+        prisma.leadSequenceState.update({
+          where: { id: state.id },
+          data: { isCompleted: true, isUnsubscribed: true }
+        })
+      ]);
+      continue;
+    }
+
+    const emailPayload = generateNativeStepEmail(state.currentStep, profile, {
+      companyName: tenant?.companyName,
+      agentName: config?.agentName,
+      industryContext: config?.industryContext,
+      offerCatalog: config?.offerCatalog,
+      qualificationCriteria: config?.qualificationCriteria
     });
 
-    if (unenrolledLeads.length > 0) {
-      await prisma.leadSequenceState.createMany({
-        data: unenrolledLeads.map(lead => ({
-          profileId: lead.id,
-          sequenceId: seq.id,
-          currentStep: 0,
-          nextActionAt: new Date(),
-          isCompleted: false,
-          isUnsubscribed: false
-        })),
-        skipDuplicates: true
-      });
+    try {
+      await sendViaGmailRotator(
+        profile.email,
+        emailPayload.subject,
+        emailPayload.html,
+        config?.agentName || tenant?.companyName || 'Reparto Commerciale',
+        tenant.id
+      );
+
+      const nextStep = state.currentStep + 1;
+      const maxSteps = state.sequence.maxSteps || tenant?.aiMaxAutonomousSteps || 4;
+      const isCompleted = nextStep >= maxSteps;
+      const delayDays = tenant?.aiDefaultDelayDays || 2;
+      const nextActionAt = new Date(Date.now() + delayDays * 24 * 60 * 60 * 1000);
+
+      await prisma.$transaction([
+        prisma.profile.update({
+          where: { id: profile.id },
+          data: { lastContactedAt: new Date(), status: 'NURTURING' }
+        }),
+        prisma.leadSequenceState.update({
+          where: { id: state.id },
+          data: {
+            currentStep: nextStep,
+            isCompleted,
+            nextActionAt
+          }
+        }),
+        prisma.automationLog.create({
+          data: {
+            tenantId: tenant.id,
+            profileId: profile.id,
+            emailAddress: profile.email,
+            subject: emailPayload.subject,
+            actionType: `NATIVE_STEP_${state.currentStep + 1}`,
+            status: 'SENT'
+          }
+        })
+      ]);
+    } catch (err: any) {
+      console.error(`[Worker] Invio rimandato per ${profile.email}:`, err.message);
     }
   }
 }
 
-const nurturingWorker = new Worker(
-  'nurturing-queue',
-  async (job: Job) => {
-    await resetDailyQuotasIfNeeded();
-    await processInboxBouncesAndReplies();
-    await autoEnrollNewLeads();
-
-    const now = new Date();
-    const activeEnrollments = await prisma.leadSequenceState.findMany({
-      where: {
-        isCompleted: false,
-        isUnsubscribed: false,
-        OR: [
-          { nextActionAt: null },
-          { nextActionAt: { lte: now } }
-        ]
-      },
-      include: {
-        profile: true,
-        sequence: {
-          include: {
-            tenant: true,
-            emails: { orderBy: { stepNumber: 'asc' } }
-          }
-        }
-      }
-    });
-
-    let sentCount = 0;
-
-    for (const enrollment of activeEnrollments) {
-      const { profile, sequence } = enrollment;
-      const tenant = sequence.tenant;
-
-      if (['QUALIFIED', 'REJECTED', 'ANOMALO'].includes(profile.status)) {
-        await prisma.leadSequenceState.update({
-          where: { id: enrollment.id },
-          data: { isCompleted: true }
-        });
-        continue;
-      }
-
-      const nextStepNumber = enrollment.currentStep + 1;
-      const maxSteps = sequence.maxSteps || tenant.aiMaxAutonomousSteps || 7;
-
-      if (nextStepNumber > maxSteps) {
-        await prisma.leadSequenceState.update({
-          where: { id: enrollment.id },
-          data: { isCompleted: true }
-        });
-        continue;
-      }
-
-      const templateStep = sequence.emails.find(e => e.stepNumber === nextStepNumber);
-
-      if (!enrollment.nextActionAt && enrollment.lastEmailedAt) {
-        const delayDays = templateStep?.delayDays ?? tenant.aiDefaultDelayDays ?? 2;
-        const targetDate = new Date(enrollment.lastEmailedAt);
-        targetDate.setDate(targetDate.getDate() + delayDays);
-        if (now < targetDate) continue;
-      }
-
-      const targetEmail = profile.email.trim().toLowerCase();
-      const dnsCheck = await preFlightEmailCheck(targetEmail);
-      if (!dnsCheck.valid) {
-        await quarantineDeadLead(
-          profile.id,
-          profile.tenantId,
-          targetEmail,
-          'DNS Pre-Flight Check',
-          dnsCheck.reason || 'Dominio non valido'
-        );
-        continue;
-      }
-
-      try {
-        let subjectToSend = templateStep?.subject || `Aggiornamento da ${tenant.companyName}`;
-        let plainTextToSend = templateStep?.plainText || '';
-        let nextDelayDays = templateStep?.delayDays ?? tenant.aiDefaultDelayDays ?? 2;
-
-        if (sequence.useAiEngine && tenant.aiEnabled) {
-          const aiOutput = await generateAutonomousStepOrReply({
-            tenantId: tenant.id,
-            profileId: profile.id,
-            stepNumber: nextStepNumber,
-            fallbackSubject: subjectToSend,
-            fallbackBody: plainTextToSend
-          });
-
-          subjectToSend = aiOutput.subject;
-          plainTextToSend = aiOutput.bodyText;
-          nextDelayDays = aiOutput.nextDelayDays;
-
-          if (aiOutput.stopSequence || ['QUALIFIED', 'REJECTED'].includes(aiOutput.newStatus)) {
-            await prisma.profile.update({
-              where: { id: profile.id },
-              data: {
-                status: aiOutput.newStatus,
-                segment: aiOutput.newSegment,
-                aiSummary: aiOutput.qualificationSummary
-              }
-            });
-            await prisma.leadSequenceState.update({
-              where: { id: enrollment.id },
-              data: { isCompleted: true }
-            });
-            continue;
-          }
-        }
-
-        if (!plainTextToSend.trim()) continue;
-
-        const baseUrl = process.env.NEXT_PUBLIC_APP_URL || 'https://tuodominio.it';
-        const senderDisplayName = tenant.companyName;
-
-        let bodyHtml = tenant.companyName.toLowerCase().includes('scintilla')
-          ? buildScintillaTemplate(plainTextToSend)
-          : `<div style="font-family: Arial, sans-serif; font-size: 14px; color: #111;">${plainTextToSend.replace(/\n/g, '<br/>')}</div>`;
-
-        const trackingPixel = `<img src="${baseUrl}/api/tracking/open?uid=${profile.id}&tid=${tenant.id}" width="1" height="1" style="display:none;" />`;
-        bodyHtml = bodyHtml.includes('</body>')
-          ? bodyHtml.replace('</body>', `${trackingPixel}</body>`)
-          : bodyHtml + trackingPixel;
-
-        bodyHtml = bodyHtml.replace(
-          /href=["'](https?:\/\/[^"']+)["']/gi,
-          `href="${baseUrl}/api/track/click?uid=${profile.id}&tid=${tenant.id}&url=$1"`
-        );
-
-        await sendViaGmailRotator(targetEmail, subjectToSend, bodyHtml, senderDisplayName);
-
-        const nextActionDate = new Date(now.getTime() + nextDelayDays * 24 * 60 * 60 * 1000);
-
-        await prisma.$transaction([
-          prisma.leadSequenceState.update({
-            where: { id: enrollment.id },
-            data: {
-              currentStep: nextStepNumber,
-              lastEmailedAt: now,
-              nextActionAt: nextActionDate
-            }
-          }),
-          prisma.profile.update({
-            where: { id: profile.id },
-            data: {
-              contactCount: { increment: 1 },
-              lastContactedAt: now
-            }
-          }),
-          prisma.aIConversationMessage.create({
-            data: {
-              tenantId: tenant.id,
-              profileId: profile.id,
-              role: 'ASSISTANT',
-              subject: subjectToSend,
-              content: plainTextToSend
-            }
-          }),
-          prisma.automationLog.create({
-            data: {
-              tenantId: tenant.id,
-              profileId: profile.id,
-              emailAddress: targetEmail,
-              subject: subjectToSend,
-              status: 'SENT'
-            }
-          })
-        ]);
-
-        sentCount++;
-      } catch (error: any) {
-        const msg = error.message || '';
-
-        if (msg.includes('superato il limite') || msg.includes('quarantena') || msg.includes('Nessuna casella')) {
-          break;
-        }
-
-        const isPermanentBounce =
-          /550|551|552|553|554|no such user|user unknown|address not found|does not exist|invalid recipient|message blocked|rejected/i.test(msg);
-
-        if (isPermanentBounce) {
-          await quarantineDeadLead(
-            profile.id,
-            tenant.id,
-            targetEmail,
-            'SMTP Hard Bounce',
-            msg
-          );
-          continue;
-        }
-      }
-    }
-
-    return { success: true, sent: sentCount };
-  },
-  { connection, concurrency: 1 }
-);
-
-nurturingWorker.on('ready', async () => {
+async function registerHeartbeatCron() {
   await nurturingQueue.add(
     'autonomous-heartbeat',
-    { mode: 'auto' },
+    {},
     {
-      repeat: { every: 15 * 60 * 1000 },
-      jobId: 'rls-autonomous-cron',
-      removeOnComplete: true,
-      removeOnFail: 10
-    }
-  );
-
-  await nurturingQueue.add(
-    'startup-run',
-    { mode: 'startup' },
-    {
-      jobId: `startup-${Date.now()}`,
+      repeat: { every: 5 * 60 * 1000 }, // Ogni 5 minuti, zero carico CPU
+      jobId: 'native-autonomous-heartbeat',
       removeOnComplete: true
     }
   );
+}
+
+const worker = new Worker(
+  'nurturing-queue',
+  async (job: Job) => {
+    await processAutonomousNurturingCycle();
+  },
+  {
+    connection,
+    concurrency: 1
+  }
+);
+
+worker.on('ready', async () => {
+  console.log('🚀 Nurturing Worker Nativo (Zero IA Esterne) online.');
+  await registerHeartbeatCron();
+  await processAutonomousNurturingCycle();
+});
+
+worker.on('error', err => {
+  console.error('❌ Errore Worker:', err.message);
 });
