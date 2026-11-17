@@ -165,7 +165,7 @@ export async function POST(req: NextRequest) {
     }
 
     let importedLeadsCount = 0;
-    letenrolledLeadsCount = 0;
+    let enrolledLeadsCount = 0;
 
     if (file && file.size > 0) {
       const arrayBuffer = await file.arrayBuffer();
