@@ -1,13 +1,13 @@
 {
-  "name": "nexus-engine",
-  "version": "0.1.0",
+  "name": "RLS",
+  "version": "0.1.5",
   "private": true,
   "scripts": {
     "dev": "next dev",
     "build": "prisma generate && next build",
     "start": "next start",
     "lint": "next lint",
-    "worker": "node --import tsx/esm src/lib/workers/emailWorker.ts"
+    "worker": "npx tsx src/lib/workers/nurturingWorker.ts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.81.0",

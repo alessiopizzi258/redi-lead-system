@@ -1,88 +1,85 @@
-import { prisma } from '@/lib/prisma';
 import nodemailer from 'nodemailer';
+import { prisma } from '@/lib/prisma';
 
-// Memorizza in RAM l'ultimo giorno in cui è stato fatto il reset
-let lastResetDateString = "";
-
-/**
- * Azzera automaticamente i contatori giornalieri quando scatta un nuovo giorno (fuso orario Roma)
- */
 export async function resetDailyQuotasIfNeeded() {
-  const todayRome = new Date().toLocaleDateString('it-IT', { timeZone: 'Europe/Rome' });
+  const now = new Date();
+  const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
 
-  if (lastResetDateString === todayRome) {
-    return; // Già resettato oggi
-  }
+  await prisma.gmailSender.updateMany({
+    where: {
+      OR: [
+        { lastSentAt: { lt: startOfToday } },
+        { lastSentAt: null }
+      ]
+    },
+    data: {
+      sentToday: 0
+    }
+  });
 
-  try {
-    // Azzera sentToday su tutte le caselle all'inizio di un nuovo giorno
-    await prisma.gmailSender.updateMany({
-      data: {
-        sentToday: 0,
-        isActive: true
-      }
-    });
-    lastResetDateString = todayRome;
-    console.log(`🌅 [Quota Reset] Contatori giornalieri SMTP azzerati per la data ${todayRome}.`);
-  } catch (err: any) {
-    console.warn(`⚠️ [Quota Reset Warning]:`, err.message);
-  }
+  await prisma.gmailSender.updateMany({
+    where: {
+      quarantineUntil: { lte: now }
+    },
+    data: {
+      quarantineUntil: null,
+      isActive: true
+    }
+  });
 }
 
-/**
- * Invia l'email ruotando le caselle disponibili e forzando il nome del Brand ("Scintilla Hub")
- */
 export async function sendViaGmailRotator(
   to: string,
   subject: string,
   html: string,
-  senderName: string = "Scintilla Hub"
+  senderDisplayName: string,
+  tenantId?: string
 ) {
-  const DAILY_MAX_LIMIT = 100;
+  const now = new Date();
 
-  // 1. Cerca una casella attiva che non abbia superato il limite giornaliero
-  const sender = await prisma.gmailSender.findFirst({
+  const senders = await prisma.gmailSender.findMany({
     where: {
       isActive: true,
-      sentToday: { lt: DAILY_MAX_LIMIT }
+      ...(tenantId ? { OR: [{ tenantId }, { tenantId: null }] } : {}),
+      OR: [
+        { quarantineUntil: null },
+        { quarantineUntil: { lte: now } }
+      ]
     },
     orderBy: { sentToday: 'asc' }
   });
 
-  if (!sender) {
-    throw new Error("Tutti gli account hanno superato il limite o sono in quarantena.");
+  const availableSender = senders.find(s => s.sentToday < s.dailyLimit);
+
+  if (!availableSender) {
+    throw new Error('Nessuna casella disponibile o tutte hanno superato il limite giornaliero');
   }
 
-  console.log(`[Email Engine] Selezionato ${sender.email}. Limite attuale: ${sender.sentToday}/${DAILY_MAX_LIMIT}`);
+  const host = availableSender.smtpHost || 'smtp.gmail.com';
+  const port = availableSender.smtpPort || 465;
 
-  // 2. Delay Umano Anti-Spam (tra 45 e 110 secondi)
-  const delayMs = Math.floor(Math.random() * (110000 - 45000 + 1)) + 45000;
-  console.log(`⏳ [Delay] Attesa di ${(delayMs / 1000).toFixed(3)}s per simulare comportamento umano...`);
-  await new Promise((resolve) => setTimeout(resolve, delayMs));
-
-  // 3. Configura il trasporto SMTP
   const transporter = nodemailer.createTransport({
-    host: 'smtp.gmail.com',
-    port: 465,
-    secure: true,
+    host,
+    port,
+    secure: port === 465,
     auth: {
-      user: sender.email,
-      pass: sender.appPassword || ""
+      user: availableSender.email,
+      pass: availableSender.appPassword.replace(/\s+/g, '')
     }
   });
 
-  // 4. Invio con forzatura esplicita del Display Name e Reply-To (Sovrascrive "Massimiliano Paolucci" nelle intestazioni)
   await transporter.sendMail({
-    from: `"${senderName}" <${sender.email}>`,
-    replyTo: `"${senderName}" <${sender.email}>`,
+    from: `"${senderDisplayName}" <${availableSender.email}>`,
     to,
     subject,
     html
   });
 
-  // 5. Incrementa il contatore degli invii di oggi
   await prisma.gmailSender.update({
-    where: { id: sender.id },
-    data: { sentToday: { increment: 1 } }
+    where: { id: availableSender.id },
+    data: {
+      sentToday: { increment: 1 },
+      lastSentAt: new Date()
+    }
   });
 }

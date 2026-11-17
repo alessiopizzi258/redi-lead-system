@@ -20,7 +20,6 @@ enum Role {
   C_LEVEL
   EMPLOYEE
   OTHER
-  // --- Estensione B2C / Residenziale (es. Scintilla Hub) ---
   PRIVATE_HOMEOWNER
   PRIVATE_TENANT
   FAMILY_DECISION_MAKER
@@ -37,6 +36,17 @@ enum LeadStatus {
   REJECTED
 }
 
+enum AIProvider {
+  OPENAI
+  ANTHROPIC
+}
+
+enum MessageRole {
+  SYSTEM
+  USER
+  ASSISTANT
+}
+
 model OtpToken {
   id        String   @id @default(cuid())
   token     String
@@ -49,33 +59,56 @@ model OtpToken {
 }
 
 model Tenant {
-  id                String   @id @default(uuid())
-  companyName       String
-  adminEmail        String?  @unique
-  apiKey            String   @unique
-  createdAt         DateTime @default(now())
+  id                     String     @id @default(uuid())
+  companyName            String
+  adminEmail             String?    @unique
+  apiKey                 String     @unique
+  createdAt              DateTime   @default(now())
 
-  // --- RLS Credits & Monetizzazione ---
-  credits           Int      @default(10)   // Crediti per sbloccare i lead QUALIFIED
-  autoUnlockLeads   Boolean  @default(true) // Scala automaticamente 1 credito alla consegna
-  qualificationThreshold Int @default(50)   // Soglia contrattuale personalizzabile per Tenant
+  credits                Int        @default(10)
+  autoUnlockLeads        Boolean    @default(true)
+  qualificationThreshold Int        @default(50)
 
-  // --- Algorithm Feeder (Meta CAPI & Google Ads) ---
-  metaPixelId       String?
-  metaCapiToken     String?
-  googleConversionUrl String?
+  metaPixelId            String?
+  metaCapiToken          String?
+  googleConversionUrl    String?
 
-  // --- Connettore CRM Outbound ---
-  crmWebhookUrl     String?
-  crmWebhookSecret  String?
+  crmWebhookUrl          String?
+  crmWebhookSecret       String?
 
-  sequences         Sequence[]
-  profiles          Profile[]
-  campaigns         Campaign[]
-  automationLogs    AutomationLog[]
-  trackingEvents    TrackingEvent[]
+  aiEnabled              Boolean    @default(true)
+  aiProvider             AIProvider @default(OPENAI)
+  aiApiKey               String?
+  aiModel                String     @default("gpt-4o-mini")
+  aiMaxAutonomousSteps   Int        @default(7)
+  aiDefaultDelayDays     Int        @default(2)
+
+  aiAgentConfig          AIAgentConfig?
+  sequences              Sequence[]
+  profiles               Profile[]
+  campaigns              Campaign[]
+  automationLogs         AutomationLog[]
+  trackingEvents         TrackingEvent[]
+  aiMessages             AIConversationMessage[]
 
   @@index([apiKey])
+}
+
+model AIAgentConfig {
+  id                    String   @id @default(uuid())
+  tenantId              String   @unique
+  agentName             String   @default("Team Commerciale")
+  industryContext       String   @db.Text
+  offerCatalog          String   @db.Text
+  qualificationCriteria String   @db.Text
+  disqualifyingRules    String   @db.Text
+  systemPromptOverride  String?  @db.Text
+  calendarBookingUrl    String?
+  whatsappContact       String?
+  temperature           Float    @default(0.4)
+  updatedAt             DateTime @updatedAt
+
+  tenant                Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
 }
 
 model Profile {
@@ -85,15 +118,13 @@ model Profile {
   firstName          String?
   lastName           String?
   phone              String?
-  vatNumber          String?    // P.IVA per verifica VIES B2B
-  leadType           String     @default("B2B") // "B2B" o "B2C"
+  vatNumber          String?
+  leadType           String     @default("B2B")
 
-  // --- Sblocco tramite RLS Credits ---
   isUnlocked         Boolean    @default(false)
   unlockedAt         DateTime?
 
-  // --- Ritorno Esiti CRM (Ciclo di Taratura) ---
-  dealStatus         String?    // "CONTACTED", "APPOINTMENT", "WON", "LOST"
+  dealStatus         String?
   dealValue          Float?
 
   sequenceStates     LeadSequenceState[]
@@ -128,14 +159,19 @@ model Profile {
   lastActivityAt     DateTime?
   lastContactedAt    DateTime?
 
+  aiSummary          String?    @db.Text
+  financialClean     Boolean?
+  employmentType     String?
+
   createdAt          DateTime   @default(now())
   updatedAt          DateTime   @default(now()) @updatedAt
 
-  tenant             Tenant          @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  tenant             Tenant                  @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   otpTokens          OtpToken[]
   automationLogs     AutomationLog[]
   trackingEvents     TrackingEvent[]
   webActivities      WebActivity[]
+  aiMessages         AIConversationMessage[]
 
   utmSource          String?
   utmCampaign        String?
@@ -144,16 +180,38 @@ model Profile {
   @@unique([tenantId, email])
 }
 
+model AIConversationMessage {
+  id          String      @id @default(uuid())
+  tenantId    String
+  profileId   String
+  role        MessageRole
+  subject     String?
+  content     String      @db.Text
+  messageId   String?     @unique
+  inReplyTo   String?
+  sentiment   String?
+  extracted   Json?
+  createdAt   DateTime    @default(now())
+
+  tenant      Tenant      @relation(fields: [tenantId], references: [id], onDelete: Cascade)
+  profile     Profile     @relation(fields: [profileId], references: [id], onDelete: Cascade)
+
+  @@index([profileId, createdAt])
+  @@index([tenantId])
+}
+
 model Sequence {
-  id          String          @id @default(cuid())
+  id          String              @id @default(cuid())
   tenantId    String
   name        String
   description String?
-  isActive    Boolean         @default(true)
-  createdAt   DateTime        @default(now())
-  updatedAt   DateTime        @updatedAt
+  isActive    Boolean             @default(true)
+  useAiEngine Boolean             @default(true)
+  maxSteps    Int                 @default(7)
+  createdAt   DateTime            @default(now())
+  updatedAt   DateTime            @updatedAt
 
-  tenant      Tenant          @relation(fields: [tenantId], references: [id])
+  tenant      Tenant              @relation(fields: [tenantId], references: [id], onDelete: Cascade)
   emails      EmailTemplate[]
   enrollments LeadSequenceState[]
 }
@@ -161,10 +219,11 @@ model Sequence {
 model EmailTemplate {
   id          String   @id @default(cuid())
   sequenceId  String
-  stepNumber  Int      // 1, 2, 3...
-  delayDays   Int      // Giorni di attesa dall'email precedente (es. 0 per immediato, 3 per la successiva)
+  stepNumber  Int
+  delayDays   Int
   subject     String
-  plainText   String   // Niente HTML, focus su Inboxing Primario (framework PAS/BAB)
+  plainText   String   @db.Text
+  aiObjective String?  @db.Text
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
@@ -172,17 +231,18 @@ model EmailTemplate {
 }
 
 model LeadSequenceState {
-  id             String   @id @default(cuid())
+  id             String    @id @default(cuid())
   profileId      String
   sequenceId     String
-  currentStep    Int      @default(0) // Step dell'ultima email inviata
-  enrolledAt     DateTime @default(now())
-  lastEmailedAt  DateTime? // Data dell'ultimo invio per calcolare il delay
-  isCompleted    Boolean  @default(false)
-  isUnsubscribed Boolean  @default(false)
+  currentStep    Int       @default(0)
+  enrolledAt     DateTime  @default(now())
+  lastEmailedAt  DateTime?
+  nextActionAt   DateTime?
+  isCompleted    Boolean   @default(false)
+  isUnsubscribed Boolean   @default(false)
 
-  profile        Profile  @relation(fields: [profileId], references: [id], onDelete: Cascade)
-  sequence       Sequence @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
+  profile        Profile   @relation(fields: [profileId], references: [id], onDelete: Cascade)
+  sequence       Sequence  @relation(fields: [sequenceId], references: [id], onDelete: Cascade)
 
   @@unique([profileId, sequenceId])
 }
@@ -193,7 +253,7 @@ model Campaign {
   name             String
   dailyLimit       Int      @default(20)
   status           String   @default("DRAFT")
-  winningVariantId String?  // Vincitore A/B Test
+  winningVariantId String?
   createdAt        DateTime @default(now())
 
   tenant           Tenant   @relation(fields: [tenantId], references: [id], onDelete: Cascade)
@@ -206,12 +266,12 @@ model AutomationLog {
   tenantId     String
   resendId     String?  @unique
   profileId    String
-  campaignId   String?  // Necessario per calcolare l'A/B test sulla singola campagna
-  variantId    String?  // Necessario per differenziare Variante A e Variante B
+  campaignId   String?
+  variantId    String?
   messageId    String?  @unique
   emailAddress String
   subject      String
-  status       String   // Tipi: SENT, FAILED, BLOCKED, OPENED, ecc.
+  status       String
   spamScore    Float?
   bounceHard   Boolean  @default(false)
   errorMessage String?
@@ -222,32 +282,33 @@ model AutomationLog {
 
   @@index([tenantId])
   @@index([profileId])
-  @@index([campaignId, variantId]) // Ottimizza le query per il ricalcolo A/B Test
+  @@index([campaignId, variantId])
 }
 
 model GmailSender {
-  id            String    @id @default(uuid())
-  email         String    @unique
-  appPassword   String    
-  provider      String    @default("GMAIL") // "GMAIL" o "CUSTOM"
-  smtpHost      String?   
-  smtpPort      Int?      @default(465)
-  imapHost      String?   
-  imapPort      Int?      @default(993)
-  isActive      Boolean   @default(true)
-  dailyLimit    Int       @default(10)
-  sentToday     Int       @default(0)
-  lastSentAt    DateTime?
+  id              String    @id @default(uuid())
+  tenantId        String?
+  email           String    @unique
+  appPassword     String
+  provider        String    @default("GMAIL")
+  smtpHost        String?
+  smtpPort        Int?      @default(465)
+  imapHost        String?
+  imapPort        Int?      @default(993)
+  isActive        Boolean   @default(true)
+  dailyLimit      Int       @default(10)
+  sentToday       Int       @default(0)
+  lastSentAt      DateTime?
   quarantineUntil DateTime?
-  errorLog      String?
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  errorLog        String?
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
 }
 
 model TrackingEvent {
   id          String   @id @default(uuid())
-  type        String   // "CLICK", "OPEN", "PAGE_VIEW"
-  url         String?  
+  type        String
+  url         String?
   profileId   String
   tenantId    String
   campaignId  String?
@@ -260,19 +321,18 @@ model TrackingEvent {
   @@index([tenantId])
 }
 
-// NUOVO MODELLO: Motore di Deanonimizzazione (Shadow Pixel)
 model WebActivity {
   id              String   @id @default(uuid())
-  profileId       String?  // Relazione opzionale (nullo se è un utente fantasma)
-  fingerprint     String   // ID hardware/browser
+  profileId       String?
+  fingerprint     String
   url             String
-  duration        Int      // Tempo di permanenza in secondi
-  scrollDepth     Int      // Profondità in pixel
+  duration        Int
+  scrollDepth     Int
   timestamp       DateTime @default(now())
 
   profile         Profile? @relation(fields: [profileId], references: [id], onDelete: Cascade)
   urlScoreAwarded Boolean  @default(false)
-  
+
   @@index([fingerprint])
   @@index([profileId])
 }
