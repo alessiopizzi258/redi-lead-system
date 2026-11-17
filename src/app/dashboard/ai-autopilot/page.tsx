@@ -1,11 +1,25 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, Suspense } from "react";
+import { useSearchParams, useRouter } from "next/navigation";
+import Link from "next/link";
 
-export default function OneClickAutopilotPage() {
-  const [tenantId, setTenantId] = useState("");
-  const [companyName, setCompanyName] = useState("Scintilla Hub");
-  const [agentName, setAgentName] = useState("Team Scintilla Rent");
+function TenantAutopilotWorkspace() {
+  const searchParams = useSearchParams();
+  const router = useRouter();
+  const urlTenantId = searchParams.get("tenantId") || "";
+
+  const [allTenants, setAllTenants] = useState<Array<{ id: string; companyName: string }>>([]);
+  const [tenantId, setTenantId] = useState(urlTenantId);
+  const [companyName, setCompanyName] = useState("");
+  const [agentName, setAgentName] = useState("");
+
+  const [stats, setStats] = useState({
+    totalLeads: 0,
+    qualifiedLeads: 0,
+    nurturingLeads: 0,
+    rejectedLeads: 0
+  });
 
   const [senderProvider, setSenderProvider] = useState("GMAIL");
   const [senderEmail, setSenderEmail] = useState("");
@@ -19,44 +33,77 @@ export default function OneClickAutopilotPage() {
   const [maxAutonomousSteps, setMaxAutonomousSteps] = useState(4);
   const [defaultDelayDays, setDefaultDelayDays] = useState(2);
 
-  const [industryContext, setIndustryContext] = useState(
-    "Noleggio a Lungo Termine di autovetture nuove per privati con busta paga a tempo indeterminato e Partite IVA."
-  );
-  const [offerCatalog, setOfferCatalog] = useState(
-    "Fiat 500 Hybrid Icon: 267€/mese + IVA (36 mesi, 30.000 km, anticipo 2.000€)\nFiat Grande Panda 1.2 100cv Icon: 269€/mese + IVA (48 mesi, 60.000 km, anticipo 2.000€)\nKia Stonic 1.0 T-GDI 100cv Urban: 310€/mese + IVA (ZERO ANTICIPO, 48 mesi, 100.000 km)\nRenault Twingo Evolution Urban: 305€/mese + IVA (48 mesi, 100.000 km, anticipo 2.500€)"
-  );
-  const [qualificationCriteria, setQualificationCriteria] = useState(
-    "Contratto a Tempo Indeterminato oppure Partita IVA attiva da almeno 2 anni, assenza di segnalazioni CRIF, interesse per rata mensile tra 260€ e 400€."
-  );
-  const [disqualifyingRules, setDisqualifyingRules] = useState(
-    "crif, segnalato, protestato, pignoramento, cattivo pagatore, disoccupato, senza busta paga, non interessa"
-  );
+  const [industryContext, setIndustryContext] = useState("");
+  const [offerCatalog, setOfferCatalog] = useState("");
+  const [qualificationCriteria, setQualificationCriteria] = useState("");
+  const [disqualifyingRules, setDisqualifyingRules] = useState("");
 
   const [databaseFile, setDatabaseFile] = useState<File | null>(null);
   const [isLaunching, setIsLaunching] = useState(false);
   const [resultMsg, setResultMsg] = useState<string | null>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
 
+  const loadTenantDetails = async (targetId: string) => {
+    if (!targetId) return;
+    try {
+      const res = await fetch(`/api/master/tenants?tenantId=${targetId}`);
+      const data = await res.json();
+      if (data?.tenant) {
+        const t = data.tenant;
+        setTenantId(t.id);
+        setCompanyName(t.companyName || "");
+        setMaxAutonomousSteps(t.aiMaxAutonomousSteps || 4);
+        setDefaultDelayDays(t.aiDefaultDelayDays || 2);
+
+        const cfg = t.aiAgentConfig;
+        setAgentName(cfg?.agentName || `Team ${t.companyName}`);
+        setIndustryContext(cfg?.industryContext || "");
+        setOfferCatalog(cfg?.offerCatalog || "");
+        setQualificationCriteria(cfg?.qualificationCriteria || "");
+        setDisqualifyingRules(
+          cfg?.disqualifyingRules || "crif, segnalato, protestato, pignoramento, disoccupato, non interessa"
+        );
+
+        const sender = t.gmailSenders?.[0];
+        if (sender) {
+          setSenderProvider(sender.provider || "GMAIL");
+          setSenderEmail(sender.email || "");
+          setSenderPassword(sender.appPassword || "");
+          setSmtpHost(sender.smtpHost || "smtp.gmail.com");
+          setSmtpPort(sender.smtpPort || 465);
+          setImapHost(sender.imapHost || "imap.gmail.com");
+          setImapPort(sender.imapPort || 993);
+          setDailyLimit(sender.dailyLimit || 90);
+        } else {
+          setSenderEmail("");
+          setSenderPassword("");
+        }
+
+        if (data.stats) setStats(data.stats);
+      }
+    } catch {}
+  };
+
   useEffect(() => {
-    fetch("/api/tenant/ai-config")
+    fetch("/api/master/tenants")
       .then(r => r.json())
       .then(data => {
-        if (data?.tenantId) {
-          setTenantId(data.tenantId);
-          setCompanyName(data.companyName || "Scintilla Hub");
-          setMaxAutonomousSteps(data.aiMaxAutonomousSteps || 4);
-          setDefaultDelayDays(data.aiDefaultDelayDays || 2);
-          if (data.config) {
-            setAgentName(data.config.agentName || "Team Scintilla Rent");
-            setIndustryContext(data.config.industryContext || industryContext);
-            setOfferCatalog(data.config.offerCatalog || offerCatalog);
-            setQualificationCriteria(data.config.qualificationCriteria || qualificationCriteria);
-            setDisqualifyingRules(data.config.disqualifyingRules || disqualifyingRules);
-          }
+        const list = data.tenants || [];
+        setAllTenants(list);
+        const initialId = urlTenantId || list[0]?.id || "";
+        if (initialId) {
+          loadTenantDetails(initialId);
         }
       })
       .catch(() => {});
-  }, []);
+  }, [urlTenantId]);
+
+  const handleSwitchTenant = (newId: string) => {
+    setResultMsg(null);
+    setErrorMsg(null);
+    router.push(`/dashboard/ai-autopilot?tenantId=${newId}`);
+    loadTenantDetails(newId);
+  };
 
   const handleLaunch = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -98,9 +145,9 @@ export default function OneClickAutopilotPage() {
       if (!res.ok) {
         setErrorMsg(data.error || "Errore durante l'avvio.");
       } else {
-        setTenantId(data.tenantId);
+        await loadTenantDetails(data.tenantId);
         setResultMsg(
-          `MOTORE NATIVO AVVIATO: ${data.importedLeadsCount} contatti caricati, ${data.enrolledLeadsCount} inseriti in coda e worker attivato.`
+          `AZIENDA "${companyName.toUpperCase()}" AVVIATA: ${data.importedLeadsCount} contatti caricati, ${data.enrolledLeadsCount} attivati nel motore automatico.`
         );
       }
     } catch (err: any) {
@@ -111,28 +158,69 @@ export default function OneClickAutopilotPage() {
   };
 
   return (
-    <div className="max-w-5xl mx-auto p-8 bg-white text-slate-900">
-      <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-8 border-b pb-4 gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight">Console One-Click Autopilot Nativo</h1>
-          <p className="text-xs text-slate-500 mt-1">
-            1. Carica Database • 2. Imposta Email (Gmail/Dominio) • 3. Inserisci Cosa Vendono • 4. Clicca OK
-          </p>
+    <div className="max-w-6xl mx-auto p-8 bg-white text-slate-900">
+      {/* Barra Superiore Multi-Azienda */}
+      <div className="flex flex-col md:flex-row justify-between items-start md:items-center mb-6 pb-4 border-b gap-4">
+        <div className="flex items-center gap-3">
+          <Link
+            href="/master"
+            className="px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold uppercase rounded"
+          >
+            ← Tutte le Aziende (/master)
+          </Link>
+          <div>
+            <h1 className="text-2xl font-bold tracking-tight">
+              Dashboard Azienda: <span className="text-emerald-700">{companyName || "Seleziona"}</span>
+            </h1>
+          </div>
         </div>
-        <div className="flex gap-2">
+
+        <div className="flex items-center gap-3 w-full md:w-auto">
+          <select
+            value={tenantId}
+            onChange={e => handleSwitchTenant(e.target.value)}
+            className="border border-slate-300 rounded px-3 py-2 text-xs font-bold uppercase bg-white"
+          >
+            {allTenants.map(t => (
+              <option key={t.id} value={t.id}>
+                Azienda: {t.companyName}
+              </option>
+            ))}
+          </select>
+
           <a
             href={`/api/tenant/leads/export?tenantId=${tenantId}&minScore=31&onlyClean=true`}
-            className="px-4 py-2.5 bg-slate-900 text-white text-xs font-bold uppercase rounded"
+            className="px-4 py-2 bg-slate-900 text-white text-xs font-bold uppercase rounded shrink-0"
           >
-            Esporta CSV Qualificati/Caldi
+            Esporta Caldi CSV
           </a>
+        </div>
+      </div>
+
+      {/* KPI real-time specifici di questa Azienda */}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+        <div className="p-4 bg-slate-50 border rounded-lg">
+          <div className="text-2xl font-bold">{stats.totalLeads}</div>
+          <div className="text-xs font-bold uppercase text-slate-500">Contatti Caricati</div>
+        </div>
+        <div className="p-4 bg-emerald-50 border border-emerald-200 rounded-lg">
+          <div className="text-2xl font-bold text-emerald-700">{stats.qualifiedLeads}</div>
+          <div className="text-xs font-bold uppercase text-emerald-700">Qualificati / Pronti Vendita</div>
+        </div>
+        <div className="p-4 bg-blue-50 border border-blue-200 rounded-lg">
+          <div className="text-2xl font-bold text-blue-700">{stats.nurturingLeads}</div>
+          <div className="text-xs font-bold uppercase text-blue-700">In Lavorazione Automatica</div>
+        </div>
+        <div className="p-4 bg-red-50 border border-red-200 rounded-lg">
+          <div className="text-2xl font-bold text-red-700">{stats.rejectedLeads}</div>
+          <div className="text-xs font-bold uppercase text-red-700">Scartati / Bounce / CRIF</div>
         </div>
       </div>
 
       <form onSubmit={handleLaunch} className="space-y-8">
         <div className="p-6 border border-slate-200 rounded-lg bg-slate-50/50 space-y-4">
           <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-700">
-            1. Carica Database Contatti (.CSV o .XLSX)
+            1. Carica Database Contatti per {companyName} (.CSV o .XLSX)
           </h2>
           <input
             type="file"
@@ -144,7 +232,7 @@ export default function OneClickAutopilotPage() {
 
         <div className="p-6 border border-slate-200 rounded-lg bg-slate-50/50 space-y-4">
           <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-700">
-            2. Imposta Email Mittente & Lettura Risposte (Gmail o Dominio)
+            2. Email Dedicata dell&apos;Azienda (Gmail o Dominio Custom)
           </h2>
 
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -173,7 +261,7 @@ export default function OneClickAutopilotPage() {
               <label className="block text-xs font-bold uppercase mb-1">Indirizzo Email</label>
               <input
                 type="email"
-                placeholder="info@azienda.it"
+                placeholder="commerciale@azienda.it"
                 value={senderEmail}
                 onChange={e => setSenderEmail(e.target.value)}
                 className="w-full border p-2.5 rounded text-sm bg-white"
@@ -246,7 +334,7 @@ export default function OneClickAutopilotPage() {
 
         <div className="p-6 border border-slate-200 rounded-lg bg-slate-50/50 space-y-4">
           <h2 className="text-sm font-bold uppercase tracking-wider text-emerald-700">
-            3. Inserisci Cosa Vendono, Prezzi e Regole di Filtro Automatico
+            3. Cosa Vende {companyName}, Catalogo Offerte e Filtri
           </h2>
 
           <div className="grid grid-cols-1 md:grid-cols-4 gap-4">
@@ -260,7 +348,7 @@ export default function OneClickAutopilotPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Firma Mittente</label>
+              <label className="block text-xs font-bold uppercase mb-1">Firma Mittente Email</label>
               <input
                 type="text"
                 value={agentName}
@@ -269,7 +357,7 @@ export default function OneClickAutopilotPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Numero Step Sequenza</label>
+              <label className="block text-xs font-bold uppercase mb-1">Step Sequenza</label>
               <input
                 type="number"
                 value={maxAutonomousSteps}
@@ -278,7 +366,7 @@ export default function OneClickAutopilotPage() {
               />
             </div>
             <div>
-              <label className="block text-xs font-bold uppercase mb-1">Giorni di Attesa tra Step</label>
+              <label className="block text-xs font-bold uppercase mb-1">Giorni tra Email</label>
               <input
                 type="number"
                 value={defaultDelayDays}
@@ -289,7 +377,7 @@ export default function OneClickAutopilotPage() {
           </div>
 
           <div>
-            <label className="block text-xs font-bold uppercase mb-1">Cosa Vendono (Descrizione Servizio/Prodotto)</label>
+            <label className="block text-xs font-bold uppercase mb-1">Cosa Vendono (Settore e Proposta)</label>
             <textarea
               rows={2}
               value={industryContext}
@@ -299,7 +387,7 @@ export default function OneClickAutopilotPage() {
           </div>
 
           <div>
-            <label className="block text-xs font-bold uppercase mb-1">Catalogo Offerte e Prezzi (1 per riga)</label>
+            <label className="block text-xs font-bold uppercase mb-1">Catalogo Offerte / Prezzi di questa Azienda (1 per riga)</label>
             <textarea
               rows={4}
               value={offerCatalog}
@@ -311,7 +399,7 @@ export default function OneClickAutopilotPage() {
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-bold uppercase mb-1 text-emerald-700">
-                Requisiti Richiesti (Mostrati nelle email)
+                Requisiti Richiesti al Cliente
               </label>
               <textarea
                 rows={3}
@@ -339,7 +427,9 @@ export default function OneClickAutopilotPage() {
           disabled={isLaunching}
           className="w-full py-4 bg-emerald-600 hover:bg-emerald-700 text-white text-sm font-bold uppercase tracking-widest rounded-lg shadow-lg disabled:opacity-50"
         >
-          {isLaunching ? "Avvio in corso..." : "OK — CARICA DATABASE E AVVIA TUTTO IN AUTOMATICO"}
+          {isLaunching
+            ? "Salvataggio e Avvio in corso..."
+            : `OK — SALVA E AVVIA IL MOTore PER ${companyName.toUpperCase() || "QUESTA AZIENDA"}`}
         </button>
 
         {resultMsg && (
@@ -355,5 +445,13 @@ export default function OneClickAutopilotPage() {
         )}
       </form>
     </div>
+  );
+}
+
+export default function OneClickAutopilotPage() {
+  return (
+    <Suspense fallback={<div className="p-8 text-sm">Caricamento console azienda...</div>}>
+      <TenantAutopilotWorkspace />
+    </Suspense>
   );
 }
