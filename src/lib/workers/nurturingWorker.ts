@@ -243,7 +243,11 @@ async function processAutonomousCycle() {
           tenant: { include: { aiAgentConfig: true } }
         }
       },
-      sequence: true
+      sequence: {
+        include: {
+          emails: { orderBy: { stepNumber: 'asc' } }
+        }
+      }
     },
     take: 30
   });
@@ -273,12 +277,23 @@ async function processAutonomousCycle() {
       continue;
     }
 
+    const customTemplates =
+      state.sequence.emails && state.sequence.emails.length > 0
+        ? state.sequence.emails.map(e => ({
+            stepNumber: e.stepNumber,
+            delayDays: e.delayDays,
+            subject: e.subject,
+            bodyText: e.plainText
+          }))
+        : undefined;
+
     const emailPayload = generateNativeStepEmail(state.currentStep, profile, {
       companyName: tenant?.companyName,
       agentName: config?.agentName,
       industryContext: config?.industryContext,
       offerCatalog: config?.offerCatalog,
-      qualificationCriteria: config?.qualificationCriteria
+      qualificationCriteria: config?.qualificationCriteria,
+      customTemplates
     });
 
     try {

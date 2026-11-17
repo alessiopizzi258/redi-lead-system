@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
+import { getDefaultStepTemplates } from '@/lib/services/aiAutonomousEngine';
 
 export const dynamic = 'force-dynamic';
 
@@ -13,7 +14,11 @@ export async function GET(req: NextRequest) {
         where: { id: tenantId },
         include: {
           aiAgentConfig: true,
-          sequences: { where: { isActive: true }, take: 1 }
+          sequences: {
+            where: { isActive: true },
+            include: { emails: { orderBy: { stepNumber: 'asc' } } },
+            take: 1
+          }
         }
       });
 
@@ -36,7 +41,7 @@ export async function GET(req: NextRequest) {
         sequenceQueue,
         replies
       ] = await Promise.all([
-        prisma.gmailSender.findMany({ where: { tenantId: tenant.id } }),
+        prisma.gmailSender.findMany({ where: { tenantId: tenant.id }, orderBy: { createdAt: 'asc' } }),
         prisma.profile.count({ where: { tenantId: tenant.id } }),
         prisma.profile.count({ where: { tenantId: tenant.id, status: 'QUALIFIED' } }),
         prisma.profile.count({ where: { tenantId: tenant.id, status: 'NURTURING' } }),
@@ -95,8 +100,20 @@ export async function GET(req: NextRequest) {
         })
       ]);
 
+      const activeSeq = tenant.sequences[0];
+      const templates =
+        activeSeq?.emails && activeSeq.emails.length > 0
+          ? activeSeq.emails.map(e => ({
+              stepNumber: e.stepNumber,
+              delayDays: e.delayDays,
+              subject: e.subject,
+              bodyText: e.plainText
+            }))
+          : getDefaultStepTemplates();
+
       return NextResponse.json({
         tenant: { ...tenant, gmailSenders },
+        templates,
         stats: {
           totalLeads,
           qualifiedLeads,
@@ -148,9 +165,14 @@ export async function GET(req: NextRequest) {
           agentName: t.aiAgentConfig?.agentName || `Team ${t.companyName}`,
           industryContext: t.aiAgentConfig?.industryContext || '',
           offerCatalog: t.aiAgentConfig?.offerCatalog || '',
-          senderEmail: primarySender ? primarySender.email : 'Nessuna email configurata',
+          senderEmail:
+            tenantSenders.length > 1
+              ? `${primarySender?.email} (+${tenantSenders.length - 1} altre)`
+              : primarySender
+              ? primarySender.email
+              : 'Nessuna email configurata',
           senderProvider: primarySender ? primarySender.provider : 'GMAIL',
-          senderActive: primarySender ? primarySender.isActive : false,
+          senderActive: tenantSenders.some(s => s.isActive),
           sentToday: tenantSenders.reduce((acc, s) => acc + (s.sentToday || 0), 0),
           dailyLimit: tenantSenders.reduce((acc, s) => acc + (s.dailyLimit || 0), 0),
           stats: {
