@@ -63,7 +63,6 @@ async function quarantineDeadLead(
       }
     })
   ]);
-  console.warn(`🛡️ [Bounce Shield] Contatto ${email} rimosso. Motivo: ${reason}`);
 }
 
 async function scanImapRepliesAndBounces() {
@@ -100,7 +99,6 @@ async function scanImapRepliesAndBounces() {
             const subject = (msg.envelope.subject || '').toLowerCase();
             const rawSource = msg.source ? msg.source.toString('utf8') : '';
 
-            // 1. Hard Bounce (Mailer-Daemon)
             if (
               fromAddress.includes('mailer-daemon') ||
               fromAddress.includes('postmaster') ||
@@ -108,24 +106,27 @@ async function scanImapRepliesAndBounces() {
               subject.includes('undeliverable') ||
               subject.includes('failure notice')
             ) {
-              const emailMatch = rawSource.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i) ||
-                                 rawSource.match(/<([^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>/);
+              const emailMatch =
+                rawSource.match(/Final-Recipient:\s*rfc822;\s*([^\s\r\n]+)/i) ||
+                rawSource.match(/<([^\s<>@]+@[^\s<>@]+\.[^\s<>@]+)>/);
               const bouncedEmail = emailMatch?.[1]?.trim().toLowerCase();
 
               if (bouncedEmail) {
                 const profile = await prisma.profile.findFirst({ where: { email: bouncedEmail } });
                 if (profile) {
-                  await quarantineDeadLead(profile.id, profile.tenantId, bouncedEmail, subject, 'Hard Bounce IMAP rilevato');
+                  await quarantineDeadLead(profile.id, profile.tenantId, bouncedEmail, subject, 'Hard Bounce IMAP');
                 }
               }
               await client.messageFlagsAdd(uid, ['\\Seen']);
               continue;
             }
 
-            // 2. Risposta Lead
             if (fromAddress) {
               const profile = (await prisma.profile.findFirst({
-                where: { email: fromAddress },
+                where: {
+                  email: fromAddress,
+                  ...(sender.tenantId ? { tenantId: sender.tenantId } : {})
+                },
                 include: { tenant: { include: { aiAgentConfig: true } } }
               })) as any;
 
@@ -137,15 +138,28 @@ async function scanImapRepliesAndBounces() {
                   disqualifyingRules: profile.tenant?.aiAgentConfig?.disqualifyingRules
                 });
 
-                await prisma.profile.update({
-                  where: { id: profile.id },
-                  data: {
-                    status: evaluation.status,
-                    segment: evaluation.segment,
-                    icpScore: Math.max(0, Math.min(100, (profile.icpScore || 35) + evaluation.icpScoreDelta)),
-                    lastContactedAt: new Date()
-                  }
-                });
+                await prisma.$transaction([
+                  prisma.profile.update({
+                    where: { id: profile.id },
+                    data: {
+                      status: evaluation.status,
+                      segment: evaluation.segment,
+                      icpScore: Math.max(0, Math.min(100, (profile.icpScore || 35) + evaluation.icpScoreDelta)),
+                      lastContactedAt: new Date(),
+                      aiSummary: evaluation.reason
+                    }
+                  }),
+                  prisma.aIConversationMessage.create({
+                    data: {
+                      tenantId: profile.tenantId,
+                      profileId: profile.id,
+                      role: 'USER',
+                      subject: msg.envelope.subject || 'Risposta Email',
+                      content: rawSource.slice(0, 2000),
+                      sentiment: evaluation.status
+                    }
+                  })
+                ]);
 
                 if (evaluation.status === 'REJECTED' || evaluation.status === 'QUALIFIED') {
                   await prisma.leadSequenceState.updateMany({
@@ -183,7 +197,7 @@ async function scanImapRepliesAndBounces() {
 async function autoEnrollNewLeads() {
   const activeSequences = await prisma.sequence.findMany({
     where: { isActive: true },
-    select: { id: true, tenantId: true, name: true }
+    select: { id: true, tenantId: true }
   });
 
   for (const seq of activeSequences) {
@@ -208,7 +222,6 @@ async function autoEnrollNewLeads() {
         })),
         skipDuplicates: true
       });
-      console.log(`🤖 [Auto-Enroll] Collegati ${unenrolledLeads.length} nuovi lead alla sequenza "${seq.name}".`);
     }
   }
 }
@@ -235,8 +248,6 @@ async function processAutonomousCycle() {
     take: 30
   });
 
-  let sentCount = 0;
-
   for (const state of dueStates) {
     const profile = state.profile;
     const tenant = profile.tenant;
@@ -257,7 +268,7 @@ async function processAutonomousCycle() {
         tenant.id,
         profile.email,
         'Verifica MX Fallita',
-        'Dominio email inesistente o privo di record MX validi'
+        'Dominio email inesistente o privo di MX'
       );
       continue;
     }
@@ -295,6 +306,7 @@ async function processAutonomousCycle() {
           data: {
             currentStep: nextStep,
             isCompleted,
+            lastEmailedAt: new Date(),
             nextActionAt
           }
         }),
@@ -303,21 +315,15 @@ async function processAutonomousCycle() {
             tenantId: tenant.id,
             profileId: profile.id,
             emailAddress: profile.email,
-            subject: emailPayload.subject,
-            actionType: `NATIVE_STEP_${state.currentStep + 1}`,
+            subject: `[Step ${state.currentStep + 1}] ${emailPayload.subject}`,
             status: 'SENT'
           }
         })
       ]);
-
-      sentCount++;
-      console.log(`✅ [Nurturing] Inviato Step ${state.currentStep + 1} a ${profile.email}`);
     } catch (err: any) {
-      console.error(`❌ [Worker Error] Invio fallito per ${profile.email}:`, err.message);
+      console.error(`❌ [Worker] Invio rimandato per ${profile.email}:`, err.message);
     }
   }
-
-  console.log(`🏁 [Nurturing Engine] Ciclo completato. Email inviate: ${sentCount}`);
 }
 
 const worker = new Worker(
@@ -329,18 +335,16 @@ const worker = new Worker(
 );
 
 worker.on('ready', async () => {
-  console.log('🚀 [Nurturing Worker Unificato] Online e in ascolto.');
-
+  console.log('🚀 [Nurturing Worker Unificato] Online.');
   await nurturingQueue.add(
     'autonomous-heartbeat',
     {},
     {
-      repeat: { every: 15 * 60 * 1000 }, // Ogni 15 minuti
+      repeat: { every: 15 * 60 * 1000 },
       jobId: 'native-autonomous-heartbeat',
       removeOnComplete: true
     }
   );
-
   await processAutonomousCycle();
 });
 

@@ -21,20 +21,96 @@ export async function GET(req: NextRequest) {
         return NextResponse.json({ error: 'Azienda non trovata' }, { status: 404 });
       }
 
-      const [gmailSenders, totalLeads, qualifiedLeads, nurturingLeads, rejectedLeads] = await Promise.all([
+      const [
+        gmailSenders,
+        totalLeads,
+        qualifiedLeads,
+        nurturingLeads,
+        rejectedLeads,
+        activeQueueCount,
+        completedQueueCount,
+        sentLogsCount,
+        bouncedLogsCount,
+        profiles,
+        outboundLogs,
+        sequenceQueue,
+        replies
+      ] = await Promise.all([
         prisma.gmailSender.findMany({ where: { tenantId: tenant.id } }),
         prisma.profile.count({ where: { tenantId: tenant.id } }),
         prisma.profile.count({ where: { tenantId: tenant.id, status: 'QUALIFIED' } }),
         prisma.profile.count({ where: { tenantId: tenant.id, status: 'NURTURING' } }),
-        prisma.profile.count({ where: { tenantId: tenant.id, status: { in: ['REJECTED', 'ANOMALO'] } } })
+        prisma.profile.count({ where: { tenantId: tenant.id, status: { in: ['REJECTED', 'ANOMALO'] } } }),
+        prisma.leadSequenceState.count({
+          where: { profile: { tenantId: tenant.id }, isCompleted: false, isUnsubscribed: false }
+        }),
+        prisma.leadSequenceState.count({
+          where: { profile: { tenantId: tenant.id }, isCompleted: true }
+        }),
+        prisma.automationLog.count({
+          where: { tenantId: tenant.id, status: 'SENT' }
+        }),
+        prisma.automationLog.count({
+          where: { tenantId: tenant.id, status: 'BOUNCED' }
+        }),
+        prisma.profile.findMany({
+          where: { tenantId: tenant.id },
+          orderBy: [{ icpScore: 'desc' }, { updatedAt: 'desc' }],
+          take: 200,
+          select: {
+            id: true,
+            email: true,
+            firstName: true,
+            lastName: true,
+            phone: true,
+            status: true,
+            segment: true,
+            icpScore: true,
+            aiSummary: true,
+            lastContactedAt: true
+          }
+        }),
+        prisma.automationLog.findMany({
+          where: { tenantId: tenant.id },
+          orderBy: { timestamp: 'desc' },
+          take: 150
+        }),
+        prisma.leadSequenceState.findMany({
+          where: { profile: { tenantId: tenant.id } },
+          orderBy: [{ isCompleted: 'asc' }, { nextActionAt: 'asc' }],
+          take: 150,
+          include: {
+            profile: {
+              select: { email: true, firstName: true, lastName: true, status: true, segment: true }
+            }
+          }
+        }),
+        prisma.aIConversationMessage.findMany({
+          where: { tenantId: tenant.id },
+          orderBy: { createdAt: 'desc' },
+          take: 60,
+          include: {
+            profile: { select: { email: true, firstName: true, lastName: true, phone: true, status: true } }
+          }
+        })
       ]);
 
       return NextResponse.json({
-        tenant: {
-          ...tenant,
-          gmailSenders
+        tenant: { ...tenant, gmailSenders },
+        stats: {
+          totalLeads,
+          qualifiedLeads,
+          nurturingLeads,
+          rejectedLeads,
+          activeQueueCount,
+          completedQueueCount,
+          sentLogsCount,
+          bouncedLogsCount
         },
-        stats: { totalLeads, qualifiedLeads, nurturingLeads, rejectedLeads }
+        profiles,
+        outboundLogs,
+        sequenceQueue,
+        replies
       });
     }
 
@@ -43,23 +119,22 @@ export async function GET(req: NextRequest) {
         orderBy: { createdAt: 'desc' },
         include: {
           aiAgentConfig: true,
-          _count: {
-            select: { profiles: true, sequences: true }
-          }
+          _count: { select: { profiles: true, sequences: true } }
         }
       }),
       prisma.gmailSender.findMany()
     ]);
 
     const enrichedTenants = await Promise.all(
-      tenants.map(async (t) => {
-        const [qualifiedCount, nurturingCount, rejectedCount] = await Promise.all([
+      tenants.map(async t => {
+        const [qualifiedCount, nurturingCount, rejectedCount, sentCount] = await Promise.all([
           prisma.profile.count({ where: { tenantId: t.id, status: 'QUALIFIED' } }),
           prisma.profile.count({ where: { tenantId: t.id, status: 'NURTURING' } }),
-          prisma.profile.count({ where: { tenantId: t.id, status: { in: ['REJECTED', 'ANOMALO'] } } })
+          prisma.profile.count({ where: { tenantId: t.id, status: { in: ['REJECTED', 'ANOMALO'] } } }),
+          prisma.automationLog.count({ where: { tenantId: t.id, status: 'SENT' } })
         ]);
 
-        const tenantSenders = allSenders.filter((s) => s.tenantId === t.id);
+        const tenantSenders = allSenders.filter(s => s.tenantId === t.id);
         const primarySender = tenantSenders.length > 0 ? tenantSenders[0] : null;
 
         return {
@@ -82,7 +157,8 @@ export async function GET(req: NextRequest) {
             total: t._count.profiles,
             qualified: qualifiedCount,
             nurturing: nurturingCount,
-            rejected: rejectedCount
+            rejected: rejectedCount,
+            sentTotal: sentCount
           }
         };
       })
